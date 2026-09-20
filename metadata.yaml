@@ -1,0 +1,28 @@
+name: astrbot_plugin_mindscape
+display_name: 灵魂景观 Mindscape
+short_desc: 给 bot 长期记忆、人格语气，和「真的可以不说」的权利
+desc: |
+  **灵魂景观（bot-mindscape）** 是一套给 AI bot 补「心智」的增强框架，
+  把群聊 bot 的四个老毛病分开治：金鱼记忆 / 文字机器 / 机械出戏 / 不叫不动。
+
+  - **认知层**：五层记忆装配（规矩 → 账本 → 风格 → 摘要 → 原文），带字数预算。
+    不是向量库 —— 角色 bot 要的不是「最相似的片段」，而是「按时间发生的事」。
+  - **表达层**：表情包采集（视觉模型判契合度）+ 按语境选图 + 斗图队形。
+  - **沉浸层**：框架报错拦截 / 输出规范化 / 空回复救援 / **真的可以什么都不做**。
+  - **唤醒层**：@必回、提到名字必回、定向性判定、自主冒泡（抽签制，不是整点）。
+
+  配置独立于框架：`~/.mindscape/config.yaml`，自带桌面版与网页版两个管理界面。
+  主仓库（源码 / 文档 / 唤醒层补丁）：https://github.com/Illusory-moon/bot-mindscape
+version: 0.1.0
+author: Illusory-moon
+repo: https://github.com/Illusory-moon/astrbot_plugin_mindscape
+astrbot_version: ">=4.17.0"
+support_platforms:
+  - aiocqhttp
+tags:
+  - 记忆
+  - 人格
+  - 群聊
+  - 沉浸
+  - 表情包
+social_link: https://github.com/Illusory-moon/bot-mindscape
