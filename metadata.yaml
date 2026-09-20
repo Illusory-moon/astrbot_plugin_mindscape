@@ -1,7 +1,7 @@
 name: astrbot_plugin_mindscape
 display_name: 心灵景观 Mindscape
 short_desc: 在认知、表达、沉浸、唤醒层面的通用增强
-desc: 为 AstrBot 打造的、在认知 / 表达 / 沉浸 / 唤醒四个层面做增强的插件。
+desc: 为 AstrBot 打造的、带五层长期记忆与人格语气的群聊增强插件，兼顾报错拦截与沉默。
 version: 0.1.0
 author: Illusory-moon
 repo: https://github.com/Illusory-moon/astrbot_plugin_mindscape
@@ -9,7 +9,7 @@ astrbot_version: ">=4.17.0"
 support_platforms:
   - aiocqhttp
 tags:
-  - 记忆
+  - 长期记忆
   - 人格
   - 群聊
   - 表情包
