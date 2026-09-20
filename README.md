@@ -2,7 +2,7 @@
 
 # 心灵景观 Mindscape · AstrBot 插件
 
-> 给 bot 补上认知、表达、沉浸、唤醒四层能力。
+> 在认知、表达、沉浸、唤醒四个层面，给 bot 做通用增强。
 
 <img src="assets/demo-2-memory.png" width="600" alt="三天前的事它还记着">
 
