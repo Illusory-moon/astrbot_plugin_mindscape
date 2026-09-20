@@ -1,6 +1,6 @@
-<p align="center"><img src="logo.png" width="110" alt="灵魂景观"></p>
+<p align="center"><img src="logo.png" width="110" alt="心灵景观"></p>
 
-# 灵魂景观 Mindscape · AstrBot 插件
+# 心灵景观 Mindscape · AstrBot 插件
 
 > 给 bot 补上认知、表达、沉浸、唤醒四层能力。
 
@@ -47,7 +47,7 @@
 
 ## 安装
 
-**方式一：插件市场** —— 搜索「**灵魂景观**」或「**mindscape**」
+**方式一：插件市场** —— 搜索「**心灵景观**」或「**mindscape**」
 
 **方式二：手动**
 
