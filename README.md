@@ -94,6 +94,18 @@ memory:
 补丁在主仓库 [`patches/`](https://github.com/Illusory-moon/bot-mindscape/tree/main/patches)，附自动安装脚本。
 不打补丁也能用，只是唤醒策略退回 AstrBot 原生的「前缀 / @ 唤醒」。
 
+## 数据与权限
+
+| | |
+|---|---|
+| **配置与数据存放** | 默认在 AstrBot 的插件数据目录 `data/plugin_data/astrbot_plugin_mindscape/`。配置里写的 `./data/xxx.md` 都相对配置文件所在目录解析，整体搬迁不会断 |
+| **自定义位置** | 环境变量 `MINDSCAPE_CONFIG` 可指向别处 |
+| **日志** | 走 `astrbot.api.logger` |
+| **消息来源库** | 认知层需要一个消息来源库 —— 就是**你自己在配置里指定的**那个 sqlite 文件。插件只以**只读**方式（`mode=ro`）打开读取，不写入、不删除 |
+| **AstrBot 会话库** | 插件**不会**读写或清理它 |
+
+---
+
 ## 许可
 
 MIT
