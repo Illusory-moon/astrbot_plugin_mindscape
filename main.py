@@ -85,6 +85,47 @@ PLACEHOLDERS = {
 IMG_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
 
+ALL_TOKENS = ("all", "*", "全部", "所有")
+
+
+def scope_list(raw):
+    """把配置里的 targets 规范成字符串列表。
+
+    跳过 None / 空串 / 纯空白 —— `str(None)` 会变成字面量 "None" 混进列表，
+    那样「这个 bot 号在不在作用域里」的判断会被一个假目标污染。
+    """
+    out = []
+    for x in (raw or []):
+        if x is None:
+            continue
+        s = str(x).strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def scope_hit(targets, self_id):
+    """这个 bot 是否在 targets 的作用域内。
+
+    空列表仍返回 True（旧语义，见上面的注释），但**加载时应当用 scope_warn() 喊一声** ——
+    静默全开是跨 bot 事故的高发地。
+    """
+    t = scope_list(targets)
+    if not t:
+        return True
+    if any(x.lower() in ALL_TOKENS for x in t):
+        return True
+    return str(self_id) in t
+
+
+def scope_warn(logger, name, targets, enabled=True):
+    """enabled 但 targets 为空 → 明确警告「这会作用于全部 bot」。"""
+    if enabled and not scope_list(targets):
+        logger.warning(
+            "[%s] enabled=True 但 targets 为空：按旧语义这会作用于**全部 bot**。"
+            "要么列出 bot 号，要么显式写 [\"all\"] —— 别让空列表替你决定。", name)
+
+
 def abs_path(path, base_dir):
     """把相对路径解析为绝对路径（相对于配置目录）。"""
     if not path:
@@ -274,6 +315,115 @@ def bot_entries():
     return bots if isinstance(bots, list) else []
 
 
+DEFAULT_BUFFER = "/opt/astrbot/data/group_ctx_buffer.jsonl"
+
+
+DEFAULT_COUNT = 15          # 注入最近多少条
+
+
+DEFAULT_WINDOW = 30 * 60    # 只取 30 分钟内的（太旧的不算上下文）
+
+
+DEFAULT_TAIL = 512 * 1024   # 只读文件尾部这么多字节（够 800 行，即使每行接近上限长度）
+
+
+GC_KEEP_LINES = 800         # 再从中取最后这么多行（与整读的旧实现等价）
+
+
+GC_PRIORITY = 1             # 先于记忆注入：这条消息是「上下文」，记忆是「背景」
+
+
+def gc_buffer_path(conf):
+    """缓冲文件路径。相对路径按【配置文件所在目录】解析（全项目一致的规矩）。"""
+    raw = str(conf.get("buffer") or "").strip()
+    if not raw:
+        return DEFAULT_BUFFER
+    if os.path.isabs(raw):
+        return os.path.normpath(raw)
+    return os.path.normpath(os.path.join(os.path.dirname(cfg.config_path()), raw))
+
+
+def gc_tail_lines(path, tail_bytes, keep):
+    """只读文件尾部的若干行。
+
+    缓冲是追加流（写端 2MB 自截断），整读一遍纯属浪费 —— 实测 1.4MB / 7389 行，
+    而 30 分钟窗口 + 只取 15 条根本用不到那么多。
+    """
+    with open(path, "rb") as fp:
+        fp.seek(0, os.SEEK_END)
+        size = fp.tell()
+        start = max(0, size - tail_bytes)
+        fp.seek(start)
+        data = fp.read()
+    lines = data.decode("utf-8", "ignore").split(chr(10))
+    if start > 0:
+        lines = lines[1:]        # 首行大概率被截断，丢掉
+    return [ln for ln in lines if ln.strip()][-keep:]
+
+
+def gc_read_recent(path, platform, group, limit, window_sec, tail_bytes):
+    """从缓冲文件读该群最近的对话（窗口过滤 + 只留最后 limit 条）。"""
+    if not path or not os.path.exists(path):
+        return []
+    try:
+        lines = gc_tail_lines(path, tail_bytes, GC_KEEP_LINES)
+    except Exception:
+        return []
+    now = time.time()
+    out = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            rec = json.loads(ln)
+        except Exception:
+            continue
+        if str(rec.get("platform")) != platform:
+            continue
+        if str(rec.get("group")) != str(group):
+            continue
+        if now - float(rec.get("ts") or 0) > window_sec:
+            continue
+        out.append(rec)
+    return out[-limit:]
+
+
+def gc_head(event):
+    """本条消息的定向性 —— 四种情形各自一句。"""
+    msgs = event.get_messages() or []
+    me = str(event.get_self_id())
+    at_self = any(type(c).__name__ == "At"
+                  and str(getattr(c, "qq", "")) == me for c in msgs)
+    reply_self = any(type(c).__name__ == "Reply"
+                     and str(getattr(c, "sender_id", "")) == me for c in msgs)
+    reason = event.get_extra("wake_reason")
+    if at_self:
+        return "本条消息【@ 了你本人】—— 它就是对你说的。"
+    if reply_self:
+        return "本条消息【引用了你说过的话】—— 它是接着你的话说的。"
+    if reason == "mention":
+        return "本条消息【没有 @ 你，但提到了你的名字】—— 大概率是在说你，可以应。"
+    return ("本条消息【既没有 @ 你，也没有提到你的名字】—— 它多半是群友之间的对话，"
+            "不是对你说的。可以接一句轻量的补充，但不是必须；不要把它当成在问你，"
+            "也不要替别人回答。")
+
+
+BL_PRIORITY = 999
+
+
+def bl_load_config():
+    c = cfg.section("blocklist") or {}
+    on = bool(c.get("enabled"))
+    table = {}
+    for t in (c.get("targets") or []):
+        sid = str(t.get("self_id") or "")
+        users = {str(u).strip() for u in (t.get("users") or []) if str(u).strip()}
+        if sid and users:
+            table[sid] = users
+    return on, table
+
+
 DEFAULT_PATTERNS = [
     "LLM 响应错误",
     "All chat models failed",
@@ -308,8 +458,8 @@ def _load_config():
     try:
         import yaml  # type: ignore
         with open(path, encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-        g = (cfg.get("guard") or {})
+            conf = yaml.safe_load(f) or {}   # 注意别叫 cfg —— 会和模块级的配置命名空间撞名
+        g = (conf.get("guard") or {})
         # 用户自定义模式是「追加」而不是「替换」：
         # 否则配置里只写几条，反而会比内置默认拦得更少（真实踩过）。
         extra = [str(p) for p in (g.get("patterns") or []) if str(p).strip()]
@@ -381,15 +531,34 @@ SI_CRON_NOTE = """# 沉默
 """
 
 
+_SI_INVIS = "\u200b\u200c\u200d\u2060\ufeff\u00ad"
+
+
 _SI_WRAP = "`*_[]【】<>《》（）()" + "“”‘’" + chr(34) + chr(39)
 
 
 _SI_TAIL = "。.!！?？~～…、,，:：;；"
 
 
+_SI_OOC_RE = re.compile(
+    r'(?:(?:这句我拿不准)?(?:我)?(?:先|就|继续)?(?:安静|默默|悄悄|静静)?地?'
+    r'(?:飘过|路过)(?:不冒头|不插话|不打扰|没接(?:这句)?|不接(?:这句)?)?'
+    r'|(?:我)?(?:这次|这句|这条)?(?:不冒头|不插话|不接这句|保持沉默|保持安静|不回复))'
+    r'(?:了|啦|吧|呢)?')
+
+
+def si_is_ooc_silence(text):
+    """整条回复只是「安静飘过」这类动作描写 —— 等价于想沉默，但用错了表达。"""
+    t = re.sub(r"[（）()\\[\\]【】《》\s]", "", text or "").strip()
+    if not t:
+        return False
+    return bool(_SI_OOC_RE.fullmatch(t)) or t.upper() == "NO_REPLY"
+
+
 def si_norm(text):
-    """归一化成可比较的形式（剃掉空白 / 包裹符号 / 结尾标点）。"""
-    t = (text or "").strip()
+    """归一化成可比较的形式（先剃零宽字符，再剃空白 / 包裹符号 / 结尾标点）。"""
+    t = (text or "").translate({ord(c): None for c in _SI_INVIS})
+    t = t.strip()
     t = t.strip(_SI_WRAP)
     t = t.strip(_SI_TAIL)
     return t.strip(_SI_WRAP).lower()
@@ -415,6 +584,36 @@ def si_load_config():
     targets = [str(x) for x in (c.get("targets") or [])]
     prompt = str(c.get("prompt") or "").strip() or (SI_PROMPT % {"token": token})
     return bool(c.get("enabled", False)), token, targets, prompt
+
+
+VS_MARK = "这一轮的消息里带了图"
+
+
+VS_HINT = """## 这一轮的消息里带了图 —— 认人之前先查
+
+- 图里的人物 / 作品，**先用 lookup_knowledge 查，查完还不确定就联网搜**；
+  不要凭印象直接认。
+- **查完还是不确定**是谁，就用你自己的口吻糊过去 —— 大意是「画面太糊、看不清」，
+  **具体怎么说按你平常的说话方式来，别照抄这句**。
+  糊弄 + 老实承认看不清，永远好过瞎编一个名字。
+- 没有依据之前，**绝不说**「这就是 XX」。认错一个人，比说不认识难看得多。
+"""
+
+
+def vs_load_config():
+    c = cfg.section("vision") or {}
+    on = bool(c.get("enabled"))
+    targets = [str(x) for x in (c.get("targets") or [])]
+    return on, targets
+
+
+def vs_has_image(event):
+    """这一轮的消息里有没有图（只看顶层组件）。"""
+    comps = getattr(getattr(event, "message_obj", None), "message", None) or []
+    for c in comps:
+        if isinstance(c, Image):
+            return True
+    return False
 
 
 DEFAULT_MAX_CHARS = 2500
@@ -671,6 +870,11 @@ def score_line(text, kw, min_ratio=0.6, min_chars=2):
         return 0.0
     if q in t:
         return 100.0
+    if not any(c.isalpha() for c in q):
+        # 纯数字/符号的词（日期、编号）只认精确命中，不做逐字模糊 ——
+        # 「09-16」曾因为 0 / 9 / - 三个字符就凑够 0.6 的命中率，
+        # 把整本日记都算成命中，报出「共命中 7478 条」这种假数字。
+        return 0.0
     chars = [c for c in q if not c.isspace() and c not in STOP_CHARS]
     if len(chars) < min_chars:
         return 0.0
@@ -691,6 +895,50 @@ def split_terms(keyword):
     return [x.strip() for x in re.split(r"[\s,，、/|]+", keyword or "") if x.strip()]
 
 
+_DATE_TOKEN = re.compile(r"(?:(\d{4})\s*[-/年]\s*)?(\d{1,2})\s*[-/月]\s*(\d{1,2})\s*号?")
+
+
+def date_key(s):
+    """从文本里抠出 (年, 月, 日)。**年可能是 None**（只写了「9月16号」）。认不出返回 None。
+
+    取第一个匹配 —— 日记的日期写在条目头上（## 2026-09-16 23:57），
+    正文里提到别的日期不该盖过它（调用方优先拿 head）。
+    """
+    for m in _DATE_TOKEN.finditer(s or ""):
+        y, mo, dy = m.group(1), int(m.group(2)), int(m.group(3))
+        if 1 <= mo <= 12 and 1 <= dy <= 31:
+            return (int(y) if y else None, mo, dy)
+    return None
+
+
+def date_filter(term):
+    """这个查询词是不是一个「日期」？是就返回 (年,月,日)（**年可为 None**），否则 None。"""
+    t = (term or "").strip()
+    if not t or len(t) > 12:
+        return None
+    if not _DATE_TOKEN.fullmatch(t):
+        return None
+    return date_key(t)
+
+
+def date_match(line_date, want):
+    """条目日期是否命中查询日期。
+
+    月日必须一致；**只有查询里写了年份时才比年份** ——
+    否则「2026-09-16」会把 2025-09-16 一起捞进来（年份被丢掉的老 bug）。
+    条目年份认不出来时不否决，避免误杀。
+    """
+    if not line_date or not want:
+        return False
+    wy, wm, wd = want
+    ly, lm, ld = line_date
+    if (wm, wd) != (lm, ld):
+        return False
+    if wy is not None and ly is not None and wy != ly:
+        return False
+    return True
+
+
 def search_diary(path, keyword, limit=DEFAULT_LIMIT, scan_lines=SCAN_LINE_CAP,
                  full=False):
     """在记忆中检索相关条目（混合检索：精确 + 模糊）。
@@ -709,6 +957,12 @@ def search_diary(path, keyword, limit=DEFAULT_LIMIT, scan_lines=SCAN_LINE_CAP,
     terms = split_terms(keyword)
     if not terms:
         return [], 0
+    # 日期词当【过滤条件】，不当打分项。
+    # 否则问「9-16」时，别的日子只要沾上同一个名字就会被一起捞回来，
+    # 再按新旧排序 —— 结果就是「今天的记忆」把「那一天」挤出去。
+    # 外部症状：她能想起很久以前的事，但把好几天混成一团。
+    wants = [d for d in (date_filter(t) for t in terms) if d]
+    words = [t for t in terms if date_filter(t) is None]
     scored = []
     head = ""
     n = 0
@@ -725,9 +979,23 @@ def search_diary(path, keyword, limit=DEFAULT_LIMIT, scan_lines=SCAN_LINE_CAP,
                 continue
             body = line.lstrip("- ").strip()
             text = head + " " + body
-            sc = max(score_line(text, t) for t in terms)
-            if sc > 0:
-                scored.append((sc, n, "[%s] %s" % (head, body)))
+            if wants:
+                # 日期以【条目头】为准：正文里提到别的日期不算
+                ld = date_key(head) or date_key(body)
+                if not any(date_match(ld, w) for w in wants):
+                    continue
+            if words:
+                per = [score_line(text, t) for t in words]
+                hit = sum(1 for s in per if s > 0)
+                if not hit:
+                    continue
+                # 命中词数优先，其次才是单词语义分。
+                # 旧实现取 max()：只沾 1 个词和沾满 5 个词同分，于是同分按行号倒序，
+                # 最新的永远排最前，旧事全被挤到 80 条之外。
+                sc = hit * 100.0 + (max(per) if per else 0.0)
+            else:
+                sc = 100.0
+            scored.append((sc, n, "[%s] %s" % (head, body)))
     if not scored:
         return [], 0
     # 先按分数降序；同分时越新越靠前
@@ -801,7 +1069,9 @@ async def recall_memory(*args, **kwargs):
 
     Args:
         keyword(string): 搜索关键词。可以给**一组近义词**，用空格或逗号分开
-            —— 你记日记时用的词，和对方问话时用的词经常不一样，多给几个才不会漏
+            —— 你记日记时用的词，和对方问话时用的词经常不一样，多给几个才不会漏。
+            要指定**日期**就直接写（2026-09-16 / 09-16 / 9月16号）：给了日期就只翻那一天。
+            问「某天谁干了什么」时，**日期和人名一起给**，比只给日期准得多
         full(boolean): 数数/汇总时必须设为 true —— 默认只给最相关的十几条，
             数数一定漏；设为 true 会返回全部命中
     """
@@ -831,6 +1101,124 @@ async def recall_memory(*args, **kwargs):
                 "或者那件事里的另一个说法）；如果还是没有，就直接说你想不起来了，"
                 "不要编。") % kw
     return format_hits(kw, hits, total, full)
+
+
+def rc_knowledge_for(self_id):
+    """取这个 bot 配置的「查阅型文档」（战斗数据这类：平时不注入，问到才查）。"""
+    for b in _bot_entries():
+        if str(b.get("self_id", "")) != str(self_id):
+            continue
+        ks = b.get("knowledge")
+        out = []
+        if isinstance(ks, list):
+            for k in ks:
+                if not isinstance(k, dict):
+                    continue
+                p = str(k.get("path") or "")
+                if p and not os.path.isabs(p):
+                    p = os.path.join(os.path.dirname(cfg.config_path()), p)
+                if p:
+                    out.append({"name": str(k.get("name") or "资料"),
+                                "desc": str(k.get("desc") or ""),
+                                "path": p})
+        return out
+    return []
+
+
+def rc_sections(text):
+    """按二级标题切段（段头一起保留）。"""
+    secs, cur = [], []
+    for line in (text or "").splitlines():
+        if line.startswith("## ") and cur:
+            secs.append("\n".join(cur).strip())
+            cur = [line]
+        else:
+            cur.append(line)
+    if cur:
+        secs.append("\n".join(cur).strip())
+    return [s for s in secs if s]
+
+
+def rc_search_sections(path, keyword, limit=3, max_chars=2000):
+    """在结构化文档里按【段落】检索 —— 问「配队」就给整段，不是散落的几行。"""
+    if not path or not os.path.exists(path):
+        return [], 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            secs = rc_sections(f.read())
+    except Exception:
+        return [], 0
+    terms = split_terms(keyword)
+    if not terms:
+        return [], len(secs)
+    scored = []
+    for s in secs:
+        low = s.lower()
+        hit = sum(1 for t in terms if t in low)
+        if hit:
+            scored.append((hit, -len(s), s))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    out, used = [], 0
+    for _, _, s in scored:
+        if out and used + len(s) > max_chars:
+            break
+        out.append(s)
+        used += len(s)
+        if len(out) >= limit:
+            break
+    return out, len(secs)
+
+
+@llm_tool(name="lookup_knowledge")
+async def lookup_knowledge(*args, **kwargs):
+    """查资料库：**战斗数据** + **人物关系**。
+
+    【战斗类】只要对方问的是战斗问题，就必须先查这里再开口，**不要凭印象编**：
+    能不能和谁组队、带什么光锥、遗器怎么配、主词条选什么、星魂提升大不大、
+    某个模式的玩法、某个机制是怎么回事。
+
+    【人物类】同样先查再开口：某个名字是谁、你跟他/她是什么关系、
+    你管他/她叫什么、某个外号指的是谁、你跟他/她之间发生过什么。
+
+    返回的是资料原文 —— 用你自己的口吻讲出来，别照本宣科念。
+    资料里没有的，就直说不知道，**绝不要编**。
+
+    Args:
+        keyword(string): 查询关键词，可以给一组（空格或逗号分开）。
+            例：配队 银狼 / 光锥 遗器 主词条 / 星魂 / 机制 笑点 / 开拓者 关系 / 旧型号
+        which(string): 指定查哪一份资料的名字（「战斗数据」或「人物关系」），不填就全查
+    """
+    kw = str(kwargs.get("keyword") or _first_str(args)).strip()
+    if not kw:
+        return "你想查哪方面的？给个关键词（配队 / 光锥 / 遗器 / 星魂 / 机制，或者某个人是谁）。"
+    ev = None
+    for a in args:
+        if hasattr(a, "get_self_id"):
+            ev = a
+            break
+    try:
+        sid = str(ev.get_self_id()) if ev is not None else ""
+    except Exception:
+        sid = ""
+    docs = rc_knowledge_for(sid)
+    if not docs:
+        return "我这边没有配置任何资料库。"
+    want = str(kwargs.get("which") or "").strip()
+    blocks, names = [], []
+    for d in docs:
+        if want and want not in d["name"]:
+            continue
+        hits, total = rc_search_sections(d["path"], kw)
+        if hits:
+            names.append(d["name"])
+            blocks.extend(hits)
+    if not blocks:
+        return ("查了资料库，没有跟「%s」直接相关的内容。"
+                "换个更贴的说法再查一次；如果还是没有，就老实说这块你不清楚，"
+                "不要凭印象编数值。") % kw
+    head = "【资料原文 · %s】用你自己的口吻讲，别照念：\n\n" % "、".join(names)
+    tail = "\n\n（以上是资料，讲的时候不要提「资料」「文档」这些词。）"
+    return head + "\n\n".join(blocks) + tail
 
 
 LINE_RE = re.compile(r"^\-\s*([^：:]{1,40})\s*[：:]\s*(.*)$")
@@ -1064,6 +1452,46 @@ def fetch(src, target, since_ts, since_seq, only_user=None):
     return rows
 
 
+def dy_render(msgs):
+    """把一批消息渲染成发给模型的那段文本。
+
+    单独抽出来，是因为**分批**和**发送**必须用同一套算法 ——
+    两边不一致就会出现「按 5000 字分好批、发出去却是 6000 字被砍」。
+    """
+    return "群聊记录：\n" + "\n".join(
+        "[" + m["time"] + "][" + m["gname"] + "] " + m["who"] + ": " + m["txt"]
+        for m in msgs)
+
+
+def chunk_by_budget(rows, batch, max_input_chars):
+    """先按条数切、再按【真实渲染长度】细分，保证每条消息都进得了某一次请求。
+
+    为什么要这么麻烦：以前是固定 batch 条一组，再在 call_llm 里把文本砍到
+    max_input_chars —— 砍掉的那截尾巴没人知道，而游标照样推到 chunk[-1]，
+    于是那几条消息**永久漏记**（把预算调小或把批次调大就能触发）。
+
+    单条自己就超预算时**抛 ValueError**：明确失败、停在原游标，绝不静默截断。
+    调用方接住它、打印、**不推进游标**。
+    """
+    out = []
+    for i in range(0, len(rows), batch):
+        cur = []
+        for r in rows[i:i + batch]:
+            trial = cur + [r]
+            if cur and len(dy_render(trial)) > max_input_chars:
+                out.append(cur)
+                cur = [r]
+            else:
+                cur = trial
+            if len(dy_render(cur)) > max_input_chars:
+                raise ValueError(
+                    "单条消息渲染后 %d 字 > max_input_chars=%d，装不进任何一批"
+                    % (len(dy_render(cur)), max_input_chars))
+        if cur:
+            out.append(cur)
+    return out
+
+
 def call_llm(llm, persona, msgs, max_input_chars, max_tokens, relations=None,
              expect_key="diary"):
     api_base = (llm.get("api_base") or "").rstrip("/")
@@ -1076,9 +1504,13 @@ def call_llm(llm, persona, msgs, max_input_chars, max_tokens, relations=None,
     if not key:
         raise RuntimeError("未找到 API key（检查 api_key_env / api_key_file）")
 
-    user = "群聊记录：\n" + "\n".join(
-        "[" + m["time"] + "][" + m["gname"] + "] " + m["who"] + ": " + m["txt"] for m in msgs
-    )
+    user = dy_render(msgs)
+    if len(user) > max_input_chars:
+        # 绝不再静默截断：截断 + 推进游标 = 被砍掉的那几条永久漏记。
+        # 调用方应当先用 chunk_by_budget 分好批。
+        raise RuntimeError(
+            "本批渲染后 %d 字，超过 max_input_chars=%d —— 调用方必须先分批"
+            % (len(user), max_input_chars))
     system = persona or DEFAULT_PERSONA
     if relations:
         # 没有这段，摘要会把「喜欢的人」写成「某个群友」—— 日记正文和人物画像
@@ -1089,7 +1521,7 @@ def call_llm(llm, persona, msgs, max_input_chars, max_tokens, relations=None,
         "model": llm.get("model") or "gpt-4o-mini",
         "messages": [
             {"role": "system", "content": system},
-            {"role": "user", "content": user[:max_input_chars]},
+            {"role": "user", "content": user},
         ],
         # 提炼类任务温度别太高；某些口径（如风格学习）需要更保守
         "temperature": float(llm.get("temperature", 0.7)),
@@ -1204,17 +1636,46 @@ def _update_people(path, people, now, relations=None):
             continue                          # 权威关系里的人，不让摘要顶掉
         existing[key] = str(v).strip()[:80]
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("# 你认识的人\n\n")
-        f.write("最后更新：" + now + "\n\n")
-        if relations:
-            f.write(REL_TITLE + "\n")
-            for r in relations:
-                f.write(r + "\n")
-            f.write("\n")
-        f.write(AUTO_TITLE + "\n")
-        for k in sorted(existing):
-            f.write("- " + k + "：" + existing[k] + "\n")
+    # 先写临时文件、再原子替换 —— 中途退出只会留下一个 .tmp，
+    # 绝不会把画像**写坏成半份**（以前直接覆盖写，进程一死就只剩半截）。
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("# 你认识的人\n\n")
+            f.write("最后更新：" + now + "\n\n")
+            if relations:
+                f.write(REL_TITLE + "\n")
+                for r in relations:
+                    f.write(r + "\n")
+                f.write("\n")
+            f.write(AUTO_TITLE + "\n")
+            for k in sorted(existing):
+                f.write("- " + k + "：" + existing[k] + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)          # 同一目录内：原子
+    except Exception:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        raise
+
+
+def dy_has_batch(path, rng, tail_bytes=200000):
+    """产物里是否已经写过这一批（看【文件尾巴】就够了）。
+
+    重跑要补的总是最后那批 —— 崩溃发生在「写完日记、游标还没落盘」之间，
+    所以只需在尾部找标记，不必扫整个文件。
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
+            return ("ms-seq:" + rng).encode("utf-8") in f.read()
+    except Exception:
+        return False
 
 
 def run_target(d):
@@ -1245,13 +1706,18 @@ def run_target(d):
             continue
         total_read += len(rows)
         all_people = {}
+        try:
+            batches = chunk_by_budget(rows, batch, max_in)
+        except ValueError as e:
+            # 分不出合法的批：停在原游标，等主人调大 max_input_chars
+            print("[mindscape_diary] 分批失败，本轮不动游标: %s" % str(e)[:140])
+            continue
         done = 0
-        for i in range(0, len(rows), batch):
+        for bi, chunk in enumerate(batches):
             if done >= max_batches:
-                print("[mindscape_diary] 已达单次上限 %d 批，剩余 %d 条留待下次"
-                      % (max_batches, len(rows) - i))
+                print("[mindscape_diary] 已达单次上限 %d 批，剩余 %d 批留待下次"
+                      % (max_batches, len(batches) - bi))
                 break
-            chunk = rows[i:i + batch]
             try:
                 res = call_llm(llm, target.get("persona"), chunk, max_in, max_tok, relations)
             except Exception as e:
@@ -1268,13 +1734,22 @@ def run_target(d):
             # 标题用这批消息自己的时间，而不是「运行时刻」—— 追历史时一次运行会
             # 写出几十批，用运行时刻就会出现几十个一模一样的 ## 标题。
             stamp = datetime.datetime.fromtimestamp(chunk[-1]["ts"]).strftime("%Y-%m-%d %H:%M")
-            if entries:
+            # 这一批的来源游标范围，写成【独立一行】的 HTML 注释：
+            #   - 渲染时看不见；检索只认 "## " 和 "- "，所以不会污染记忆文本
+            #   - 万一「日记写完、游标还没落盘」就退出，重跑时靠它认出这批已写过，
+            #     只推进游标、不再追加一遍（以前会整整重复一批）
+            rng = "%s-%s" % (chunk[0]["seq"], chunk[-1]["seq"])
+            if entries and not dy_has_batch(out_file, rng):
                 with open(out_file, "a", encoding="utf-8") as fp:
+                    fp.write("<!-- ms-seq:" + rng + " -->\n")
                     fp.write("## " + stamp + "\n")
                     for e in entries:
                         fp.write("- " + str(e) + "\n")
                     fp.write("\n")
                 total_added += len(entries)
+            elif entries:
+                print("[mindscape_diary] 这批已写过（ms-seq:%s），只推进游标" % rng)
+                total_added += 0
             # 人物画像先攒着，一轮结束时合并落盘一次即可
             people = res.get("people") or {}
             if isinstance(people, dict) and people:
@@ -1366,13 +1841,17 @@ def ln_run_target(d, target):
     if not rows:
         return 0, 0
 
+    try:
+        batches = chunk_by_budget(rows, batch, max_in)
+    except ValueError as e:
+        print("[mindscape_learn] 分批失败，本轮不动游标: %s" % str(e)[:140])
+        return 0, 0
     total_added = 0
-    for i in range(0, len(rows), batch):
-        if (i // batch) >= max_batches:
-            print("[mindscape_learn] 已达单次上限 %d 批，剩余 %d 条留待下次"
-                  % (max_batches, len(rows) - i))
+    for bi, chunk in enumerate(batches):
+        if bi >= max_batches:
+            print("[mindscape_learn] 已达单次上限 %d 批，剩余 %d 批留待下次"
+                  % (max_batches, len(batches) - bi))
             break
-        chunk = rows[i:i + batch]
         try:
             res = call_llm(llm, persona, chunk, max_in, max_tok,
                            expect_key="observations")
@@ -1614,6 +2093,83 @@ def flatten(text, join_with="，", drop_last_if_short=False, short_len=8):
         else:
             out += join_with + nxt
     return out
+
+
+TRACE_PRIORITY = -100
+
+
+TRACE_KEY = "_mindscape_trace_t0"
+
+
+TRACE_PENDING_MAX = 64        # 没等到响应的残留记录最多留这么多（防无限增长）
+
+
+DEFAULT_WARN_MS = 8000        # 慢于此 → 升级成 WARNING，方便 grep
+
+
+DEFAULT_WARN_CHARS = 20000    # system_prompt 超过这个字数 → 疑似异常注入
+
+
+def tr_key(event):
+    """本轮的键：同一会话的请求与响应必须能对上。"""
+    return str(getattr(event, "unified_msg_origin", "") or event.get_self_id())
+
+
+def tr_ctx_chars(contexts):
+    """上下文里所有文本的字符总数（只数长度，不碰内容）。"""
+    total = 0
+    for m in (contexts or []):
+        if not isinstance(m, dict):
+            total += len(str(m))
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            total += len(c)
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    total += len(part["text"])
+    return total
+
+
+def tr_tool_count(request):
+    """这一轮挂了多少个工具（工具 schema 本身就占 prompt）。"""
+    ft = getattr(request, "func_tool", None)
+    if ft is None:
+        return 0
+    try:
+        return len(ft.names())
+    except Exception:
+        return 0
+
+
+def tr_hist(request):
+    """会话历史的规模，返回 (条数, 字符数)。
+
+    ⚠️ 框架在 `on_llm_request` 这一刻**可能还没把历史并进 `contexts`**
+    （实测两个字段都是 0/空）—— 所以只用 `contexts` 当体积指标会一直是 0。
+    拿不到就返回 (0, 0)：量到 0 不代表没有历史，只代表此刻它还不在手上。
+    """
+    conv = getattr(request, "conversation", None)
+    raw = getattr(conv, "history", None) if conv is not None else None
+    if not isinstance(raw, str) or not raw:
+        return (0, 0)
+    try:
+        items = json.loads(raw)
+    except Exception:
+        return (0, len(raw))
+    return ((len(items) if isinstance(items, list) else 0), len(raw))
+
+
+def tr_usage(resp):
+    """token 用量；框架没给就留空。"""
+    u = getattr(resp, "usage", None)
+    if not u:
+        return ""
+    try:
+        return " tok=%d+%d/%d" % (u.input_other, u.input_cached, u.output)
+    except Exception:
+        return ""
 # ==================================================================
 # 命名空间：让 cfg.xxx() / core.xxx() 这类调用在合并后依然可用
 # ==================================================================
@@ -1627,6 +2183,34 @@ class _MindscapeConfigNS:
 
 
 cfg = _MindscapeConfigNS()
+class BlockMixin:
+    def setup(self, context):
+        self.bl_on, self.bl_table = bl_load_config()
+        self.bl_count = 0
+        logger.info("[mindscape_block] loaded | enabled=%s | bots=%s",
+                    self.bl_on, {k: len(v) for k, v in self.bl_table.items()})
+
+    @filter.event_message_type(EventMessageType.ALL, priority=BL_PRIORITY)
+    async def bl_pre_block(self, event: AstrMessageEvent):
+        """命中黑名单 → 终止事件传播：不回复、不采集图片、不进任何插件。"""
+        try:
+            if not self.bl_on:
+                return
+            users = self.bl_table.get(str(event.get_self_id()))
+            if not users:
+                return
+            sender = str(event.get_sender_id())
+            if sender not in users:
+                return
+            self.bl_count += 1
+            logger.info("[mindscape_block] 前置拦截 | bot=%s sender=%s（第 %d 次）",
+                        event.get_self_id(), sender, self.bl_count)
+            event.stop_event()
+        except Exception as e:
+            # 拦截逻辑出错时放行 —— 宁可漏拦，也不能把正常消息吞掉
+            logger.warning("[mindscape_block] 拦截异常，已放行: %s", str(e)[:120])
+
+
 class GuardMixin:
     def setup(self, context):
 
@@ -1822,6 +2406,8 @@ class StickersMixin:
         self.index_path = st_abs(self.s_c.get("index") or os.path.join(self.dir, "index.json"))
         self.seen_path = st_abs(self.s_c.get("seen") or os.path.join(self.dir, "seen.json"))
         os.makedirs(self.dir, exist_ok=True)
+        self.seen_ok = set()        # 已入库（键 = 分类:md5）
+        self.seen_no = set()        # 明确拒绝（重启后也不清）
         self.seen = self._load_seen()
         self._bg = set()            # 后台采集任务，留引用防被 GC 掉
         logger.info(
@@ -1830,24 +2416,37 @@ class StickersMixin:
         )
 
     def _load_seen(self):
+        """读去重表。
+
+        结构：{"accepted": [...], "rejected": [...]}，键都是「分类:md5」。
+          - accepted：真正入库过的图
+          - rejected：**明确拒绝**过的图（超尺寸 / 视觉判定 related=false）
+
+        ⚠️ 两类必须分开。以前只有一张平表，自愈时「只保留图库里现存的图」——
+        于是明确拒绝的记录一重启就被清掉：同一张图被反复下载、反复调用视觉 API
+        （白花钱），甚至可能因为判定翻转又进了库。
+        现在只清理 accepted 里「图已从库中删除」的墓碑，rejected 一律保留。
+
+        自愈判据必须用**内容 md5**，不能拿文件名前缀凑：导入脚本会把文件重命名成
+        「<前缀>_xxxx.gif」，前缀就不再是 md5 —— 用前缀匹配会把真实存在的图误判成
+        墓碑，去重记录一丢，那张图重发就会以原名再入一份（造出重复）。
+        ponytail: 启动时把整个图库哈希一遍（目前 51 张 / 54MB，约 0.2s）。
+                   涨到几百 MB 就该改成 sidecar 的 md5 清单。
+        """
         try:
             with open(self.seen_path, encoding="utf-8") as f:
                 d = json.load(f)
         except Exception:
             return set()
-        if not isinstance(d, list):
+        legacy = isinstance(d, list)
+        if legacy:
+            keys = set(d)
+        elif isinstance(d, dict):
+            keys = set(d.get("accepted") or []) | set(d.get("rejected") or [])
+        else:
             return set()
-        keys = set(d)
-        # 自愈：去重表的条目在「图库条目被删」之后不会跟着删，于是变成**墓碑** ——
-        # 那张图再发一次也不会被采集，用户看到的是「删掉以后就再也收不回来」。
-        #
-        # 判据必须用**内容的 md5**，不能拿文件名前缀凑：导入脚本会把文件重命名成
-        # 「<前缀>_xxxx.gif」，前缀就不再是 md5 了 —— 用前缀匹配会把真实存在的图
-        # 误判成墓碑，去重记录一丢，那张图重发就会以原名再入一份（造出重复）。
-        # ponytail: 这里把整个图库哈希一遍（目前 51 张 / 54MB，约 0.2s，只在启动时做）。
-        #            图库涨到几百 MB 就该改成 sidecar 的 md5 清单。
+        live = set()
         try:
-            live = set()
             for x in (load_index(self.index_path) or []):
                 fn = str(x.get("file") or "")
                 if not fn:
@@ -1855,26 +2454,49 @@ class StickersMixin:
                 with open(os.path.join(self.dir, fn), "rb") as fp:
                     live.add(str(x.get("category") or "") + ":"
                              + hashlib.md5(fp.read()).hexdigest())
-            kept = set()
-            for k in keys:
-                if k in live:
-                    kept.add(k)
-            if kept != keys:
-                self.seen = kept
-                self._save_seen()
-                logger.info("[mindscape_stickers] 去重表自愈：%d -> %d（清掉 %d 条墓碑）",
-                            len(keys), len(kept), len(keys) - len(kept))
-            return kept
         except Exception:
+            # 图库读不出来就不敢动去重表：全按拒绝保留，宁可少收也不重复烧 API
+            self.seen_ok, self.seen_no = set(), keys
             return keys
+        if legacy:
+            # 老格式分不清来源：在图库里的算入库，其余**保守归入拒绝**
+            self.seen_ok = set(k for k in keys if k in live)
+            self.seen_no = keys - self.seen_ok
+            logger.info("[mindscape_stickers] 去重表迁移：老平表 %d 条 → 入库 %d / 拒绝 %d",
+                        len(keys), len(self.seen_ok), len(self.seen_no))
+            self._save_seen()
+            return keys
+        acc = set(d.get("accepted") or [])
+        self.seen_ok = set(k for k in acc if k in live)
+        self.seen_no = set(d.get("rejected") or [])
+        if self.seen_ok != acc:
+            logger.info("[mindscape_stickers] 去重表自愈：入库 %d -> %d（清掉 %d 条墓碑），"
+                        "拒绝记录 %d 条原样保留",
+                        len(acc), len(self.seen_ok), len(acc) - len(self.seen_ok),
+                        len(self.seen_no))
+            self._save_seen()
+        return self.seen_ok | self.seen_no
 
     def _save_seen(self):
         try:
             with open(self.seen_path, "w", encoding="utf-8") as f:
-                json.dump(sorted(self.seen)[-3000:], f)
+                json.dump({"accepted": sorted(self.seen_ok)[-3000:],
+                           "rejected": sorted(self.seen_no)[-3000:]}, f)
         except Exception:
             pass
 
+    def _mark_seen(self, key, accepted):
+        """记一条去重记录。
+
+        accepted=False = **明确拒绝**（超尺寸 / 判定不相关）—— 这类记录重启后
+        也不会被自愈清掉；只有「入库过的图被从库里删了」才清。
+        """
+        if accepted:
+            self.seen_ok.add(key)
+        else:
+            self.seen_no.add(key)
+        self.seen.add(key)
+        self._save_seen()
     def _add_index(self, fname, category, verdict):
         """加锁 + 重读 + 合并 + 原子写，避免和导入脚本互相覆盖。"""
         entry = {
@@ -1966,8 +2588,7 @@ class StickersMixin:
             # 复用的代价是 'int' object is not subscriptable —— 通过闸门的图全存不进去。
             w, ih = img_size(path)
             if w and ih and max(w, ih) > max_side:
-                self.seen.add(key)      # 记下：同一张不必反复下载重判
-                self._save_seen()
+                self._mark_seen(key, False)   # 明确拒绝：重启后也不该重判
                 logger.info("[mindscape_stickers] 跳过 %dx%d（超过 %d，疑似截图/壁纸）",
                             w, ih, max_side)
                 return
@@ -1978,8 +2599,7 @@ class StickersMixin:
             return
         if not verdict.get("related"):
             # 明确判定为「不相关」：认为已处理，不再重复消耗 API
-            self.seen.add(key)
-            self._save_seen()
+            self._mark_seen(key, False)   # 明确拒绝：重启后也不该重判
             return
 
         ext = os.path.splitext(path)[1].lower() or ".jpg"
@@ -1999,8 +2619,7 @@ class StickersMixin:
                 pass
             return
 
-        self.seen.add(key)          # 只有真正入库成功才记为已见
-        self._save_seen()
+        self._mark_seen(key, True)    # 只有真正入库成功才算「入库」
         self._add_index(fname, category, verdict)
         logger.info("[mindscape_stickers] 已入库 %s | %s", fname, verdict.get("name"))
 
@@ -2305,11 +2924,12 @@ class FormatMixin:
         self.f_c = cfg.section("format")
         self.targets = [str(x) for x in (self.f_c.get("targets") or [])]
         logger.info("[mindscape_format] loaded | %d target(s)", len(self.targets))
+        scope_warn(logger, "mindscape_format", self.targets)
 
     @filter.on_decorating_result(priority=900)
     async def flatten_result(self, event: AstrMessageEvent):
         try:
-            if self.targets and str(event.get_self_id()) not in self.targets:
+            if not scope_hit(self.targets, event.get_self_id()):
                 return
             result = event.get_result()
             if result is None or not result.is_llm_result():
@@ -2334,8 +2954,15 @@ class FormatMixin:
 class RescueMixin:
     def setup(self, context):
         self.r_cfg = cfg.section("rescue") or {}
-        logger.info("[mindscape_rescue] loaded | %s",
-                    "启用" if self.r_cfg.get("enabled", True) else "关闭")
+        env = self.r_cfg.get("api_key_env") or ""
+        self.r_ready = bool((self.r_cfg.get("api_base") or "").strip()
+                            and env and os.environ.get(env))
+        # 一定要把「就绪没就绪」喊出来：以前拿不到 key 就静默 return，
+        # 结果「空回复救援」一次都没生效过，日志里却一个字都没有。
+        logger.info("[mindscape_rescue] loaded | %s | %s",
+                    "启用" if self.r_cfg.get("enabled", True) else "关闭",
+                    "就绪" if self.r_ready
+                    else ("未就绪（缺 api_base 或环境变量 %s），空回复将无法兜住" % (env or "(未配置)")))
 
     @filter.on_llm_response()
     async def rescue_empty(self, event: AstrMessageEvent, response):
@@ -2347,16 +2974,110 @@ class RescueMixin:
             # 已经有文字 / 已经带了结果链（比如只发了图）/ 还要调工具，都不算空回复
             if (getattr(response, "completion_text", "") or "").strip():
                 return
-            if getattr(response, "result_chain", None):
+            # 走到这里 = 这一轮文字真的空了。先记一笔，方便日后定位；
+            # 以前这里什么都不留，出问题时只能看到一句「The message is empty」。
+            logger.info("[mindscape_rescue] 空文字回复 | chain=%s tools=%s ready=%s",
+                        bool(getattr(response, "result_chain", None)),
+                        bool(getattr(response, "tools_call_name", None)),
+                        getattr(self, "r_ready", False))
+            if not getattr(self, "r_ready", False):
+                return
+            # 有结果链不等于「有东西可发」：实测出现过「文字被清空、链里只剩
+            # 空壳组件」的情况 —— 那时 rescue 必须出手，否则就是一次静默的「叫它不理」。
+            _chain = getattr(getattr(response, "result_chain", None), "chain", None) or []
+            _media = ("Image", "Record", "Video", "File", "Node", "Nodes")
+            if any(type(_c).__name__ in _media for _c in _chain):
                 return
             if getattr(response, "tools_call_name", None):
                 return
             text = await self._ask_once(event)
             if text:
                 response.completion_text = text
-                logger.info("[mindscape_rescue] 空回复已补: %s", text[:40])
+                logger.info("[mindscape_rescue] 空回复已补（%s）: %s",
+                            "带人设快照" if str(event.get_extra("_ms_ctx_prompt") or "").strip()
+                            else "通用兜底", text[:40])
         except Exception as e:
             logger.warning("[mindscape_rescue] 救援失败: %s", str(e)[:120])
+
+    @filter.on_llm_request(priority=-10)
+    async def rc_snapshot(self, event: AstrMessageEvent, request):
+        """抓一份「这一轮真实用到的」人设 + 记忆 + 风格快照。
+
+        priority=-10 让它最后跑 —— 等 memory / silence 都往 system_prompt 里塞完了再取，
+        拿到的就是模型真正看到的那一段。救援补话时带上它，补出来才像这个 bot。
+        以前救援用的是配置里那句通用人设 —— 对味道重的人设来说补出来就是白开水。
+        """
+        try:
+            sp = getattr(request, "system_prompt", "") or ""
+            if sp:
+                event.set_extra("_ms_ctx_prompt", sp[-1400:])
+            rows = []
+            for m in (getattr(request, "contexts", None) or [])[-5:]:
+                if not isinstance(m, dict):
+                    continue
+                role = m.get("role")
+                c = m.get("content")
+                if isinstance(c, list):
+                    c = " ".join((x.get("text") or "") for x in c if isinstance(x, dict))
+                c = str(c or "").strip()
+                if role in ("user", "assistant") and c:
+                    rows.append(("对方" if role == "user" else "我") + "：" + c[:120])
+            if rows:
+                event.set_extra("_ms_ctx_recent", "\n".join(rows[-4:]))
+        except Exception:
+            pass
+
+    @filter.on_using_llm_tool()
+    async def rc_capture_sent(self, event: AstrMessageEvent, tool, tool_args):
+        """记下这一轮真正发出去的话 —— 冒泡轮要用它替换任务黑话。"""
+        try:
+            if getattr(tool, "name", "") != "send_message_to_user":
+                return
+            if not isinstance(tool_args, dict):
+                return
+            parts = []
+            for m in (tool_args.get("messages") or []):
+                if isinstance(m, dict) and m.get("type") == "plain" and m.get("text"):
+                    parts.append(str(m["text"]))
+            if parts:
+                event.set_extra("_ms_sent_text", " ".join(parts)[:300])
+        except Exception:
+            pass
+
+    @filter.on_llm_response()
+    async def rc_clean_cron_meta(self, event: AstrMessageEvent, response):
+        """冒泡轮：把「任务黑话」的总结换成它真正说过的那句话。
+
+        AstrBot 的 cron 提示词要求模型「总结并输出你的动作和结果」，于是对话历史里
+        会存下这种句子：
+
+            [CronJob] bubble-xxx: 冒泡完成。动作：以<某人>身份在群里发了一句「…」，
+            没提任务/定时，没提问，没刷屏。
+
+        这些词（任务 / 定时 / 系统 / 身份）每轮都会被当作上下文喂回去，是出戏源头。
+        但它同时也是「我冒过泡、说了什么」的唯一留痕 —— 所以不是删掉，而是**改写成
+        第一人称**：人记住的是自己说过的话，不是「我完成了一个任务」。
+        """
+        try:
+            if not event.get_extra("cron_job"):
+                return
+            if response is None:
+                return
+            txt = (getattr(response, "completion_text", "") or "").strip()
+            if not txt:
+                return          # 本来就没话，没什么可清的
+            # 判据【不能】等 "[CronJob]" 前缀 —— 那个前缀是 AstrBot 在 runner 跑完之后
+            # 自己拼上去的，模型自己写的那段根本没有它（所以这条逻辑空转了四天）。
+            # 冒泡轮里模型只能靠工具说话，收尾那段必然是「任务总结」，直接换掉即可。
+            sent = str(event.get_extra("_ms_sent_text") or "").strip()
+            if sent:
+                response.completion_text = sent
+                logger.info("[mindscape_rescue] 冒泡轮历史去任务化（原文 %d 字）-> %s", len(txt), sent[:40])
+            else:
+                response.completion_text = ""
+                logger.info("[mindscape_rescue] 冒泡轮没发话，历史不留痕")
+        except Exception as e:
+            logger.warning("[mindscape_rescue] 冒泡轮清理失败: %s", str(e)[:120])
 
     async def _ask_once(self, event):
         import httpx
@@ -2364,7 +3085,10 @@ class RescueMixin:
         key = os.environ.get(self.r_cfg.get("api_key_env") or "", "")
         if not api_base or not key:
             return ""
-        persona = self.r_cfg.get("persona") or "一个自然的聊天伙伴"
+        # 优先用「这一轮真实的人设/记忆/风格」快照；配置里的 persona 只当兜底
+        persona = (str(event.get_extra("_ms_ctx_prompt") or "").strip()
+                   or self.r_cfg.get("persona") or "一个自然的聊天伙伴")
+        recent = str(event.get_extra("_ms_ctx_recent") or "").strip()
         last = ""
         try:
             data = getattr(event, "message_obj", None)
@@ -2372,9 +3096,12 @@ class RescueMixin:
         except Exception:
             last = ""
         prompt = (
-            "你是" + persona + "。刚才群友说了：\n"
-            + (last or "（一条消息）")
-            + "\n\n请用一句话自然回应（不超过30字），不要解释、不要客套、不要提及你是 AI。"
+            "下面是你的人设、记忆和说话风格（照着来，不要照抄原文）：\n"
+            + persona
+            + (("\n\n最近几轮对话：\n" + recent) if recent else "")
+            + "\n\n刚才对方说了：\n" + (last or "（一条消息）")
+            + "\n\n请用你自己的口吻补一句自然的回应（不超过30字）。"
+              "不要解释、不要客套、不要提及你是 AI，也不要提你刚才没说话。"
         )
         try:
             async with httpx.AsyncClient(timeout=float(self.r_cfg.get("timeout") or 20)) as cli:
@@ -2407,13 +3134,12 @@ class SilenceMixin:
         self.si_count = 0
         logger.info("[mindscape_silence] loaded | enabled=%s token=%s targets=%d",
                     self.si_on, self.si_token, len(self.si_targets))
+        scope_warn(logger, "mindscape_silence", self.si_targets, self.si_on)
 
     def _si_hit(self, event):
         if not self.si_on:
             return False
-        if not self.si_targets:
-            return True
-        return str(event.get_self_id()) in self.si_targets
+        return scope_hit(self.si_targets, event.get_self_id())
 
     @filter.on_llm_request()
     async def si_grant(self, event: AstrMessageEvent, request):
@@ -2447,10 +3173,12 @@ class SilenceMixin:
             txt = result.get_plain_text() or ""
             if not txt.strip():
                 return
-            if si_is_silence(txt, self.si_token):
+            if si_is_silence(txt, self.si_token) or si_is_ooc_silence(txt):
                 self.si_count += 1
-                logger.info("[mindscape_silence] 真静默（第 %d 次）| bot=%s",
-                            self.si_count, event.get_self_id())
+                logger.info("[mindscape_silence] 真静默（第 %d 次%s）| bot=%s",
+                            self.si_count,
+                            "" if si_is_silence(txt, self.si_token) else "，动作描写",
+                            event.get_self_id())
                 event.clear_result()
                 event.stop_event()
                 return
@@ -2460,16 +3188,186 @@ class SilenceMixin:
                     t = getattr(comp, "text", None)
                     if isinstance(t, str) and t.strip():
                         comp.text = si_strip(t, self.si_token)
+                # 剃完只剩空白 —— 那它本来就是想沉默（只是令牌形式没被上面认出来，
+                # 比如尾部多了零宽字符）。按真静默处理，否则会留下一条「空回复」：
+                # 用户看到的是「叫它不理」，日志里也什么都没有。
+                if not si_norm(result.get_plain_text() or ""):
+                    self.si_count += 1
+                    logger.info("[mindscape_silence] 真静默（第 %d 次，令牌带杂字）| bot=%s",
+                                self.si_count, event.get_self_id())
+                    event.clear_result()
+                    event.stop_event()
         except Exception as e:
             logger.warning("[mindscape_silence] 拦截失败: %s", str(e)[:120])
+
+
+class VisionMixin:
+    def setup(self, context):
+        self.vs_on, self.vs_targets = vs_load_config()
+        logger.info("[mindscape_vision] loaded | enabled=%s | targets=%s",
+                    self.vs_on, self.vs_targets or "全部")
+        scope_warn(logger, "mindscape_vision", self.vs_targets, self.vs_on)
+
+    def _vs_hit(self, event):
+        if not self.vs_on:
+            return False
+        return scope_hit(self.vs_targets, event.get_self_id())
+
+    @filter.on_llm_request()
+    async def vs_hint(self, event: AstrMessageEvent, request):
+        """只在「这一轮真的带了图」时，往系统提示里塞一次提醒。"""
+        try:
+            if not self._vs_hit(event):
+                return
+            if not vs_has_image(event):
+                return
+            old = getattr(request, "system_prompt", "") or ""
+            if VS_MARK in old:
+                return
+            request.system_prompt = old + "\n\n" + VS_HINT
+            logger.info("[mindscape_vision] 有图：已提醒先查再认 | bot=%s",
+                        event.get_self_id())
+        except Exception as e:
+            logger.warning("[mindscape_vision] 注入失败: %s", str(e)[:120])
+
+
+class GroupctxMixin:
+    def setup(self, context):
+        c = cfg.section("groupctx")
+        self.gc_on = bool(c.get("enabled"))
+        self.gc_path = gc_buffer_path(c)
+        self.gc_count = int(c.get("count") or DEFAULT_COUNT)
+        self.gc_window = int(c.get("window_sec") or DEFAULT_WINDOW)
+        self.gc_tail = int(c.get("tail_bytes") or DEFAULT_TAIL)
+        self.gc_mark = True if c.get("directness") is None else bool(c.get("directness"))
+        self.gc_targets = [str(x) for x in (c.get("targets") or [])]
+        logger.info(
+            "[mindscape_groupctx] loaded | enabled=%s | buffer=%s | 最近 %d 条/%ds | 定向性=%s",
+            self.gc_on, self.gc_path, self.gc_count, self.gc_window, self.gc_mark)
+        scope_warn(logger, "mindscape_groupctx", self.gc_targets, self.gc_on)
+
+    @filter.on_llm_request(priority=GC_PRIORITY)
+    async def gc_inject(self, event: AstrMessageEvent, request: ProviderRequest):
+        try:
+            if not self.gc_on or not scope_hit(self.gc_targets, event.get_self_id()):
+                return
+            gid = event.get_group_id()
+            if gid is None:
+                return
+            # 自主冒泡轮不要群缓冲 —— 那会让它退化成「接别人的话」，
+            # 而这一轮的意义是自己找话题。
+            if event.get_extra("cron_job"):
+                return
+            recs = gc_read_recent(self.gc_path, event.get_platform_name(),
+                                  str(gid), self.gc_count, self.gc_window,
+                                  self.gc_tail)
+            lines = []
+            if self.gc_mark:
+                lines += ["", "【本条消息的定向性】", gc_head(event)]
+            if recs:
+                lines.append("")
+                lines.append("【本群最近的真实聊天记录（用于理解上下文，不要逐条回应，也不要复述）】")
+                for r in recs:
+                    lines.append(str(r.get("who", "?"))[:16] + ": "
+                                 + str(r.get("text", ""))[:200])
+            if not lines:
+                return
+            request.system_prompt = ((request.system_prompt or "") + chr(10)
+                                     + chr(10).join(lines))
+            logger.info("[mindscape_groupctx] 注入 self=%s 群=%s 历史=%d 条",
+                        event.get_self_id(), gid, len(recs))
+        except Exception as exc:
+            logger.warning("[mindscape_groupctx] 注入失败: %s", str(exc)[:120])
+
+
+class TraceMixin:
+    def setup(self, context):
+        c = cfg.section("trace")
+        self.tr_on = True if c.get("enabled") is None else bool(c.get("enabled"))
+        self.tr_warn_ms = int(c.get("warn_ms") or DEFAULT_WARN_MS)
+        self.tr_warn_chars = int(c.get("warn_chars") or DEFAULT_WARN_CHARS)
+        self.tr_pending = {}
+        logger.info(
+            "[mindscape_trace] loaded | enabled=%s | 慢于 %dms 或 system_prompt"
+            " 超过 %d 字时改成 WARNING",
+            self.tr_on, self.tr_warn_ms, self.tr_warn_chars)
+
+    def tr_label(self, event):
+        """日志里区分两个 bot 的那一列。"""
+        return "self=%s 群=%s" % (event.get_self_id(),
+                                  event.get_group_id() or "-")
+
+    def tr_remember(self, key, info):
+        self.tr_pending[key] = info
+        # 失败/中断的轮次永远等不到响应 —— 别让它把内存攒起来
+        if len(self.tr_pending) > TRACE_PENDING_MAX:
+            for k in list(self.tr_pending)[:-TRACE_PENDING_MAX // 2]:
+                self.tr_pending.pop(k, None)
+
+    @filter.on_llm_request(priority=TRACE_PRIORITY)
+    async def tr_measure_request(self, event: AstrMessageEvent,
+                                 request: ProviderRequest):
+        if not self.tr_on:
+            return
+        try:
+            hn, hc = tr_hist(request)
+            info = {
+                "t": time.time(),
+                "sys": len(request.system_prompt or ""),
+                "ctx": len(request.contexts or []),
+                "ctx_chars": tr_ctx_chars(request.contexts),
+                "hist_n": hn,
+                "hist_c": hc,
+                "tools": tr_tool_count(request),
+                "user": len(request.prompt or ""),
+            }
+            self.tr_remember(tr_key(event), info)
+            event.set_extra(TRACE_KEY, info)
+            logger.info(
+                "[mindscape_trace] 出站 %s sys=%d字 会话=%d条/%d字 上下文=%d条 工具=%d 输入=%d字",
+                self.tr_label(event), info["sys"], info["hist_n"],
+                info["hist_c"], info["ctx"], info["tools"], info["user"])
+        except Exception as e:
+            logger.warning("[mindscape_trace] 记录请求失败: %s", str(e)[:120])
+
+    @filter.on_llm_response()
+    async def tr_measure_response(self, event: AstrMessageEvent, response):
+        if not self.tr_on:
+            return
+        try:
+            info = self.tr_pending.pop(tr_key(event), None)
+            if not isinstance(info, dict):
+                info = event.get_extra(TRACE_KEY)
+            if not isinstance(info, dict) or not info.get("t"):
+                logger.warning(
+                    "[mindscape_trace] 收到响应但没找到本轮的请求记录（出站日志可能没打）| %s",
+                    self.tr_label(event))
+                return
+            ms = int((time.time() - float(info["t"])) * 1000)
+            slow = ms >= self.tr_warn_ms
+            fat = int(info.get("sys") or 0) >= self.tr_warn_chars
+            line = ("[mindscape_trace] %s %s 耗时=%.2fs sys=%d字"
+                    " 会话=%d条/%d字 工具=%d 输入=%d字%s")
+            args = ("SLOW" if slow else ("FAT" if fat else "完成"),
+                    self.tr_label(event), ms / 1000.0,
+                    info.get("sys") or 0, info.get("hist_n") or 0,
+                    info.get("hist_c") or 0, info.get("tools") or 0,
+                    info.get("user") or 0, tr_usage(response))
+            if slow or fat:
+                logger.warning(line, *args)
+            else:
+                logger.info(line, *args)
+        except Exception as e:
+            logger.warning("[mindscape_trace] 记录耗时失败: %s", str(e)[:120])
 # ==================================================================
 # 插件入口：把所有 Mixin 的钩子收进同一个类
 # ==================================================================
-class MindscapePlugin(GuardMixin, MemoryMixin, StickersMixin, StickerUseMixin, FormatMixin, RescueMixin, SilenceMixin, star.Star):
+class MindscapePlugin(BlockMixin, GuardMixin, MemoryMixin, StickersMixin, StickerUseMixin, FormatMixin, RescueMixin, SilenceMixin, VisionMixin, GroupctxMixin, TraceMixin, star.Star):
     def __init__(self, context):
         self.context = context
         self.name = "mindscape"
         self.author = "bot-mindscape"
+        BlockMixin.setup(self, context)
         GuardMixin.setup(self, context)
         MemoryMixin.setup(self, context)
         StickersMixin.setup(self, context)
@@ -2477,4 +3375,7 @@ class MindscapePlugin(GuardMixin, MemoryMixin, StickersMixin, StickerUseMixin, F
         FormatMixin.setup(self, context)
         RescueMixin.setup(self, context)
         SilenceMixin.setup(self, context)
-        logger.info("[mindscape] 插件已加载（7 个模块）")
+        VisionMixin.setup(self, context)
+        GroupctxMixin.setup(self, context)
+        TraceMixin.setup(self, context)
+        logger.info("[mindscape] 插件已加载（11 个模块）")
