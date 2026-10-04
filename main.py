@@ -21,6 +21,7 @@ from astrbot.api import llm_tool, logger, star
 from astrbot.api import logger
 from astrbot.api import logger, star
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.core.message.components import At
 from astrbot.core.message.components import Image
 from astrbot.core.message.message_event_result import MessageEventResult
 from astrbot.core.provider.entities import ProviderRequest
@@ -333,6 +334,15 @@ GC_KEEP_LINES = 800         # 再从中取最后这么多行（与整读的旧�
 GC_PRIORITY = 1             # 先于记忆注入：这条消息是「上下文」，记忆是「背景」
 
 
+DEFAULT_IMG_MAX = 1         # 历史里的图最多挂几张（1 张就够：多一张 = 多一次视觉推理 = 慢十几秒）
+
+
+DEFAULT_IMG_WINDOW = 120    # 只挂最近 2 分钟发过的图（「发完马上问」的窗口，再久基本无关）
+
+
+DEFAULT_IMG_SAME = True     # 只挂「跟当前说话的人同一个发送者」的图（附图也慢，别乱挂）
+
+
 def gc_buffer_path(conf):
     """缓冲文件路径。相对路径按【配置文件所在目录】解析（全项目一致的规矩）。"""
     raw = str(conf.get("buffer") or "").strip()
@@ -409,6 +419,163 @@ def gc_head(event):
             "也不要替别人回答。")
 
 
+def gc_quote(event):
+    """本条消息引用了什么 —— 返回 (有没有引用, 引用的是不是我自己, 引用里有没有图)。
+
+    为什么必须单独说一句：aiocqhttp 会 get_msg 把**被引用那条的完整组件链**塞进
+    Reply.chain，框架还会把引用里的图渲染成 [Image Attachment in quoted message: …]
+    混进**本条消息的正文**。模型只看正文，**看不出这张图是谁发的** ——
+    实测：有人引用了 bot 自己发的表情包，bot 回头对着自己的图说「诶，这不是我嘛~」。
+    但反过来也要说清：**引用别人的图，正是「让她看图」的正规入口之一**
+    （先发图、再引用 + @ 她）—— 那种图就该看、该回应，不能一律当成「旧图，别理」。
+    """
+    msgs = event.get_messages() or []
+    me = str(event.get_self_id())
+    quoted = mine = has_img = False
+    for c in msgs:
+        if type(c).__name__ != "Reply":
+            continue
+        quoted = True
+        mine = str(getattr(c, "sender_id", "") or "") == me
+        for x in (getattr(c, "chain", None) or []):
+            if type(x).__name__ == "Image":
+                has_img = True
+    if not has_img:                      # 兜底：链里拿不到，就看框架渲染进正文的那句标记
+        try:
+            if "Image Attachment in quoted message" in str(event.message_str or ""):
+                has_img = True
+        except Exception:
+            pass
+    return (quoted, mine, has_img)
+
+
+def gc_quote_note(mine):
+    """引用里那张图是谁发的 —— 只给方向，不写台词。"""
+    if mine:
+        return ("⚠️ 本条消息**引用的是你自己之前那条（带图或表情包）**：那张图是**你自己发的**，"
+                "你本来就知道它长什么样 —— 不用对着它认图、点评、问「这是什么」，"
+                "也**别把它说成是对方拿出来的、搬出来的**；除非有人明确让你聊这张图。")
+    return ("⚠️ 本条消息**引用的是别人发的图**：这张图是**别人发出来给你看的**，"
+            "该看就看、该接话就接话 —— 别当成你自己发过的东西。")
+
+
+def gc_quote_rewrite(request, mine):
+    """把自己发的引用图，在**请求正文里**就地改写成明确的归属。
+
+    为什么不能只加系统提示：系统提示里那句笔记压不住「有人给我发了张图」的直觉 ——
+    用户消息正文里明晃晃挂着 [Image Attachment in quoted message: path …] 和那张真图。
+    实测 2026-10-03 22:50：她刚自己发的图 + 一句话，群友隔 21 秒引用回来 + @ 她，
+    她下一句就把那张图说成是「对方搬出来顶包」的东西了 —— 归属判定没错（日志打出
+    「引用=自己发的图」），是**那句话**把图说成了对方的素材。所以在正文里写清楚。
+    """
+    if not mine:
+        return 0
+    parts = getattr(request, "extra_user_content_parts", None)
+    if not parts:
+        return 0
+    new_text = ("[引用里的图：这是**你自己**之前发出去的那张（连图一起被引回来了）—— "
+                "对方只是接着你的话说，不是对方发给你的新图/新素材]")
+    n = 0
+    for i in range(len(parts)):
+        p = parts[i]
+        t = getattr(p, "text", None)
+        if not (isinstance(t, str) and "Image Attachment in quoted message" in t):
+            continue
+        try:
+            parts[i] = type(p)(text=new_text)   # 先换对象：pydantic 冻结模型也能改
+        except Exception:
+            try:
+                p.text = new_text               # 普通可写模型
+            except Exception:
+                continue
+        n += 1
+    return n
+
+
+def gc_has_image(event):
+    """本条消息**自己**带图吗（引用里的图不算 —— 那条走 gc_quote）。"""
+    try:
+        return any(type(c).__name__ == "Image" for c in (event.get_messages() or []))
+    except Exception:
+        return False
+
+
+def gc_history_images(recs, window_sec, cap, now=None, sender=None):
+    """群缓冲里「还活着」的那几张图 —— [(路径, 谁发的, 时间)]，新的在前。
+
+    主人 2026-10-04：「不管引用与否，真人都看得见图，能在我们这边优化的就在这边优化，
+    不要指望用户端改」→ 历史消息里带的图，我们自己也挂上（缓冲里补丁记的 imgs）。
+    边界：只认缓冲里记过 imgs 的记录、只认文件还在的、只取最近 window_sec、最多 cap 张。
+    """
+    if not recs or cap <= 0:
+        return []
+    now = time.time() if now is None else now
+    out, seen = [], set()
+    for r in reversed(list(recs)):
+        try:
+            ts = float(r.get("ts") or 0)
+        except Exception:
+            continue
+        if window_sec and now - ts > window_sec:
+            continue
+        if sender is not None and str(r.get("uid") or "") != str(sender):
+            continue
+        for p in (r.get("imgs") or []):
+            p = str(p)
+            if p in seen:
+                continue
+            seen.add(p)
+            out.append((p, str(r.get("who") or "?"), ts))
+            if len(out) >= cap:
+                return out
+    return out
+
+
+GC_IMG_CACHE = {}
+
+
+GC_IMG_CACHE_MAX = 32
+
+
+async def gc_resolve_ref(ref):
+    """把一条「图片引用」变成能喂给模型的本地路径。
+
+    缓冲里记的可能是本地路径（图已经落过盘），也可能是 URL —— 唤醒判定在预处理之前，
+    那时候只有 URL。是 URL 就地补一次下载（AstrBot 自己的下载器，带它的证书/代理处理）。
+    """
+    ref = str(ref or "")
+    if not ref:
+        return ""
+    if ref.startswith("file://"):
+        ref = ref[7:]
+    try:
+        if os.path.exists(ref):
+            return ref
+    except Exception:
+        return ""
+    if not ref.startswith(("http://", "https://")):
+        return ""
+    hit = GC_IMG_CACHE.get(ref)
+    if hit:
+        return hit if os.path.exists(hit) else ""
+    try:
+        from astrbot.core.utils.io import download_image_by_url
+    except Exception:
+        return ""
+    p = ""
+    try:
+        p = await download_image_by_url(ref)
+    except Exception as exc:
+        logger.warning("[mindscape_groupctx] 历史图下载失败 %s: %s", ref[:60], str(exc)[:80])
+        return ""
+    if p and os.path.exists(p):
+        if len(GC_IMG_CACHE) >= GC_IMG_CACHE_MAX:
+            GC_IMG_CACHE.clear()
+        GC_IMG_CACHE[ref] = p
+        return p
+    return ""
+
+
 BL_PRIORITY = 999
 
 
@@ -441,6 +608,13 @@ DEFAULT_PATTERNS = [
     "Traceback (most recent call last)",
     "openai.",
     "httpx.",
+    # 框架**自己**的报错口径（实测漏过一次，见下面的 send 级兜底）：
+    #   internal.py 的 except 里直接发 "Error occurred while processing agent request: …"
+    "Error occurred while processing agent",
+    "Error occurred during AI execution",
+    "Failed to download file from",
+    "Error Type:",
+    "Error Message:",
 ]
 
 
@@ -489,6 +663,73 @@ def redact(text, limit=100):
     for rx, rep in _SECRET_PATTERNS:
         t = rx.sub(rep, t)
     return t[:limit]
+
+
+MS_SEND_WRAPPED = "_mindscape_send_guard"
+
+
+def ms_chain_text(message):
+    """从 MessageChain 里取纯文本（拿不到就返回空串，不抛）。"""
+    try:
+        got = message.get_plain_text()
+        if isinstance(got, str):
+            return got
+    except Exception:
+        pass
+    parts = []
+    for c in (getattr(message, "chain", None) or []):
+        t = getattr(c, "text", None)
+        if isinstance(t, str):
+            parts.append(t)
+    return "".join(parts)
+
+
+def ms_install_send_guard(check):
+    """给平台事件类的 send 包一层，返回这次包了几个类（幂等）。"""
+    try:
+        from astrbot.core.platform.astr_message_event import AstrMessageEvent as _Base
+    except Exception:
+        return 0
+    seen, targets = set(), []
+
+    def walk(cls):
+        if cls in seen:
+            return
+        seen.add(cls)
+        if cls is not _Base and "send" in cls.__dict__:
+            targets.append(cls)
+        for sub in cls.__subclasses__():
+            walk(sub)
+
+    walk(_Base)
+    n = 0
+    for cls in targets:
+        if getattr(cls, MS_SEND_WRAPPED, False):
+            continue
+        orig = cls.__dict__["send"]
+
+        async def _ms_send(self, message, _orig=orig, **kw):
+            try:
+                txt = ms_chain_text(message)
+            except Exception:
+                txt = ""
+            if txt.strip():
+                try:
+                    hit = check(txt)
+                except Exception:
+                    hit = False
+                if hit:
+                    logger.warning(
+                        "[mindscape_guard] 拦下直接发送的报错（这条不走结果管线）: %s",
+                        redact(txt))
+                    return None
+            return await _orig(self, message, **kw)
+
+        _ms_send.__name__ = getattr(orig, "__name__", "send")
+        setattr(cls, MS_SEND_WRAPPED, True)
+        setattr(cls, "send", _ms_send)
+        n += 1
+    return n
 
 
 def is_error_text(text, patterns=None, regex=None):
@@ -2076,6 +2317,24 @@ async def save_sticker(*args, **kwargs):
 PUNCT = "。！？~…，、；："
 
 
+PERIODS = ("。", "．")
+
+
+def drop_period(text):
+    """句尾不点标点：末尾的「。」去掉（留空），句中的「。」换成「，」。
+
+    为什么不是一律换成「~」：有些沉重的句子拿波浪号收尾会变味 ——
+    规矩是**不用句号表示「说完了」**，不是每句都要卖萌。所以末尾留空，
+    中间用逗号接着往下走（和本模块压平多段时的连接符一致）。
+    """
+    if not text:
+        return text
+    for ch in PERIODS:
+        if ch in text:
+            text = "，".join(p for p in (x.strip() for x in text.split(ch)) if p)
+    return text
+
+
 def flatten(text, join_with="，", drop_last_if_short=False, short_len=8):
     """把多段文本压成一段。"""
     if not text:
@@ -2170,6 +2429,114 @@ def tr_usage(resp):
         return " tok=%d+%d/%d" % (u.input_other, u.input_cached, u.output)
     except Exception:
         return ""
+
+
+MN_THROTTLE = 15            # 同一会话两次点名之间的最小间隔（秒）
+
+
+MN_BUF_LIMIT = 200          # 从群缓冲最多取多少条来找人
+
+
+MN_BUF_WINDOW = 1800        # 只认半小时内说过话的人
+
+
+MN_BUF_TAIL = 512 * 1024
+
+
+MN_PENDING_TTL = 120       # 排队的 @ 最多等这么久（跨轮了就丢掉，别挂到下一句去）
+
+
+MN_HOOK_PRIORITY = 100     # on_decorating_result：跑在 guard(999) 之后
+
+
+def mn_load_config():
+    c = cfg.section("mention") or {}
+    return bool(c.get("enabled")), [str(x) for x in (c.get("targets") or [])]
+
+
+def mn_match_member(who, members):
+    """在成员表里找 who → (qq, 显示名)；找不到给 ("", "")。
+
+    顺序：纯数字当号 → 群名片/昵称精确 → 唯一的部分匹配（多个命中就不猜）。
+    纯函数，自检直接跑。"""
+    who = str(who or "").strip().lstrip("@").strip()
+    if not who:
+        return "", ""
+    members = [m for m in (members or []) if m]
+    if who.isdigit():
+        for m in members:
+            if str(m.get("user_id") or "") == who:
+                return who, str(m.get("card") or m.get("nickname") or "")
+        if 5 <= len(who) <= 12:      # 成员名单里没有也认：QQ 号本来就是「直接给号」的用法
+            return who, ""
+    for key in ("card", "nickname"):
+        for m in members:
+            v = str(m.get(key) or "").strip()
+            if v and v == who:
+                return str(m.get("user_id") or ""), v
+    hits = []
+    for m in members:
+        for key in ("card", "nickname"):
+            v = str(m.get(key) or "").strip()
+            if v and (who in v or v in who):
+                hits.append((str(m.get("user_id") or ""), v))
+                break
+    if len(hits) == 1 and hits[0][0]:
+        return hits[0]
+    return "", ""
+
+
+def mn_take_pending(pending, key, now, ttl=MN_PENDING_TTL):
+    """取出一条排队的点名（过期的丢掉）→ (qq, name) 或 None。纯函数，自检直接跑。"""
+    item = (pending or {}).pop(key, None)
+    if not item:
+        return None
+    try:
+        qq, name, ts = item
+    except Exception:
+        return None
+    if ttl and now - float(ts) > ttl:
+        return None
+    return (str(qq), str(name or ""))
+
+
+MN_PENDING = {}
+
+
+@filter.on_decorating_result(priority=MN_HOOK_PRIORITY)
+async def mn_attach_hook(*args, **kwargs):
+    """把排队的 @ 插到这条回复的**最前面**；这轮没正文就单独发一个 @。
+
+    为什么用模块级钩子而不是类方法：类方法的 decorating 钩子在本部署里**没被调用**
+    （同插件另外四个类方法钩子都跑得好好的，排查过 stop_event / 流式输出 / 注册行都在），
+    模块级注册是 AstrBot 最标准的那条路，先换过来把功能做通。
+    """
+    try:
+        event = None
+        for a in args:
+            if hasattr(a, "get_self_id"):
+                event = a
+                break
+        if event is None or not MN_PENDING:
+            return
+        key = "%s|%s" % (event.get_self_id(), event.get_group_id())
+        item = mn_take_pending(MN_PENDING, key, time.time())
+        if not item:
+            logger.info("[mindscape_mention] 键对不上，丢弃排队（%s）", key)
+            return
+        qq, name = item
+        result = event.get_result()
+        chain = getattr(result, "chain", None) if result is not None else None
+        if chain:
+            chain.insert(0, At(qq=qq, name=name))
+            logger.info("[mindscape_mention] @ 挂在回复前 self=%s qq=%s（带正文）",
+                        event.get_self_id(), qq)
+        else:
+            event.set_result(MessageEventResult().at(name=name, qq=qq))
+            logger.info("[mindscape_mention] @ 单独发 self=%s qq=%s（这轮没正文）",
+                        event.get_self_id(), qq)
+    except Exception as exc:
+        logger.warning("[mindscape_mention] 挂 @ 失败: %s", str(exc)[:100])
 # ==================================================================
 # 命名空间：让 cfg.xxx() / core.xxx() 这类调用在合并后依然可用
 # ==================================================================
@@ -2216,7 +2583,32 @@ class GuardMixin:
 
         self.patterns, self.regex = _load_config()
         self.blocked = 0
-        logger.info("[mindscape_guard] loaded | %d 条拦截规则", len(self.patterns))
+        g = cfg.section("guard")
+        self.g_send = True if g.get("send_guard") is None else bool(g.get("send_guard"))
+        armed = self._ms_arm_send_guard() if self.g_send else 0
+        logger.info("[mindscape_guard] loaded | %d 条拦截规则 | send 级兜底=%s（本次包了 %d 个类）",
+                    len(self.patterns), self.g_send, armed)
+
+    def _ms_hit(self, text):
+        """这条文本是不是框架报错（结果管线与 send 级兜底共用同一套判据）。"""
+        return is_error_text(text, self.patterns, self.regex)
+
+    def _ms_arm_send_guard(self):
+        """装 send 级兜底（幂等）。平台事件类这时可能还没 import，等下面那个钩子再补一次。"""
+        try:
+            return ms_install_send_guard(self._ms_hit)
+        except Exception as e:
+            logger.warning("[mindscape_guard] send 级兜底安装失败: %s", str(e)[:120])
+            return 0
+
+    @filter.on_astrbot_loaded()
+    async def ms_arm_late(self, *args, **kwargs):
+        """框架加载完毕：这时候平台事件类都在了，把漏掉的补上。"""
+        if not getattr(self, "g_send", False):
+            return
+        n = self._ms_arm_send_guard()
+        if n:
+            logger.info("[mindscape_guard] send 级兜底补装 %d 个类", n)
 
     @filter.on_decorating_result(priority=999)
     async def block_error(self, event: AstrMessageEvent):
@@ -2312,7 +2704,19 @@ class MemoryMixin:
                                or DEFAULT_STYLE_RECENT_CHARS)
                 sty2 = _clean_style(read_recent(sr_path, sr_chars))
 
-            if len(mem) < min_chars and not dig and not notes and not sty and not sty2:
+            # 规矩也是要注入的内容，必须一起参与这个「有没有东西可注入」的判断 ——
+            # 一个白板起步的 bot（新接进来的通道）日记/摘要/账本/风格全空，
+            # 只看那几样就会**连规矩一起被跳过**，于是它永远不知道该记账，
+            # 账本也就永远是空的（鸡生蛋）。
+            rules = [str(x).strip() for x in (bot.get("rules") or []) if str(x).strip()]
+            if (
+                len(mem) < min_chars
+                and not dig
+                and not notes
+                and not sty
+                and not sty2
+                and not rules
+            ):
                 return
 
             old = getattr(request, "system_prompt", "") or ""
@@ -2348,7 +2752,6 @@ class MemoryMixin:
             )
             # 规矩：每个 bot 自己的行为约束，写在配置里（不进代码，避免把
             # 某个人设特有的规矩硬编码进通用框架）。
-            rules = [str(x).strip() for x in (bot.get("rules") or []) if str(x).strip()]
             if rules:
                 block += SECTION_RULES + "\n" + "\n".join("- " + r for r in rules) + "\n\n"
             if notes:
@@ -2923,7 +3326,11 @@ class FormatMixin:
 
         self.f_c = cfg.section("format")
         self.targets = [str(x) for x in (self.f_c.get("targets") or [])]
-        logger.info("[mindscape_format] loaded | %d target(s)", len(self.targets))
+        # 句尾去句号：**子选项，空 = 关**（故意不沿用「空 = 全部 bot」那条旧语义，
+        # 否则谁忘写一行，全场的句号都被剃光）
+        self.f_np = [str(x) for x in (self.f_c.get("no_period") or [])]
+        logger.info("[mindscape_format] loaded | %d target(s) | 句尾去句号=%s",
+                    len(self.targets), self.f_np or "关")
         scope_warn(logger, "mindscape_format", self.targets)
 
     @filter.on_decorating_result(priority=900)
@@ -2940,11 +3347,14 @@ class FormatMixin:
             join_with = self.f_c.get("join_with") or "，"
             drop = bool(self.f_c.get("drop_last_if_short", False))
             short_len = int(self.f_c.get("short_len") or 8)
+            no_period = bool(self.f_np) and scope_hit(self.f_np, event.get_self_id())
             for comp in chain:
                 txt = getattr(comp, "text", None)
                 if not isinstance(txt, str) or not txt.strip():
                     continue
                 new = flatten(txt, join_with, drop, short_len)
+                if no_period:
+                    new = drop_period(new)
                 if new != txt:
                     comp.text = new
         except Exception as e:
@@ -3241,9 +3651,15 @@ class GroupctxMixin:
         self.gc_tail = int(c.get("tail_bytes") or DEFAULT_TAIL)
         self.gc_mark = True if c.get("directness") is None else bool(c.get("directness"))
         self.gc_targets = [str(x) for x in (c.get("targets") or [])]
+        self.gc_img_on = True if c.get("images") is None else bool(c.get("images"))
+        self.gc_img_max = int(c.get("image_max") or DEFAULT_IMG_MAX)
+        self.gc_img_window = int(c.get("image_window_sec") or DEFAULT_IMG_WINDOW)
+        self.gc_img_same = (DEFAULT_IMG_SAME if c.get("image_same_sender") is None
+                            else bool(c.get("image_same_sender")))
         logger.info(
-            "[mindscape_groupctx] loaded | enabled=%s | buffer=%s | 最近 %d 条/%ds | 定向性=%s",
-            self.gc_on, self.gc_path, self.gc_count, self.gc_window, self.gc_mark)
+            "[mindscape_groupctx] loaded | enabled=%s | buffer=%s | 最近 %d 条/%ds | 定向性=%s | 历史图=%s(max %d/%ds 同人=%s)",
+            self.gc_on, self.gc_path, self.gc_count, self.gc_window, self.gc_mark,
+            self.gc_img_on, self.gc_img_max, self.gc_img_window, self.gc_img_same)
         scope_warn(logger, "mindscape_groupctx", self.gc_targets, self.gc_on)
 
     @filter.on_llm_request(priority=GC_PRIORITY)
@@ -3258,24 +3674,78 @@ class GroupctxMixin:
             # 而这一轮的意义是自己找话题。
             if event.get_extra("cron_job"):
                 return
+            now = time.time()
             recs = gc_read_recent(self.gc_path, event.get_platform_name(),
                                   str(gid), self.gc_count, self.gc_window,
                                   self.gc_tail)
+            q_quoted, q_mine, q_img = gc_quote(event)
+            hist_refs = []
+            if self.gc_img_on and not gc_has_image(event) and not (q_quoted and q_img):
+                hist_refs = gc_history_images(
+                    recs, self.gc_img_window, self.gc_img_max * 3,
+                    sender=str(event.get_sender_id()) if self.gc_img_same else None)
+            hist_imgs = []
+            ref2path = {}
+            for _ref, _w, _t in hist_refs:
+                if len(hist_imgs) >= self.gc_img_max:
+                    break
+                _p = await gc_resolve_ref(_ref)
+                if _p:
+                    hist_imgs.append((_p, _w, _t))
+                    ref2path[str(_ref)] = _p
+            img_no = {}
+            for _k, (_p, _w, _t) in enumerate(hist_imgs, 1):
+                img_no[_p] = _k
             lines = []
             if self.gc_mark:
                 lines += ["", "【本条消息的定向性】", gc_head(event)]
+                if q_quoted and q_img:
+                    lines.append(gc_quote_note(q_mine))
+                    if q_mine and gc_quote_rewrite(request, True):
+                        logger.info("[mindscape_groupctx] 引用正文改写=自己发的图")
             if recs:
                 lines.append("")
                 lines.append("【本群最近的真实聊天记录（用于理解上下文，不要逐条回应，也不要复述）】")
                 for r in recs:
-                    lines.append(str(r.get("who", "?"))[:16] + ": "
-                                 + str(r.get("text", ""))[:200])
+                    tag = " ".join("［附件%d］" % img_no[ref2path[str(x)]]
+                                   for x in (r.get("imgs") or []) if str(x) in ref2path)
+                    lines.append("[" + time.strftime("%H:%M:%S", time.localtime(float(r.get("ts") or now)))
+                                 + "] " + str(r.get("who", "?"))[:16] + ": "
+                                 + str(r.get("text", ""))[:200]
+                                 + (("  " + tag) if tag else ""))
+            if hist_imgs:
+                lines.append("")
+                lines.append("【上面历史里带的那几张图，按顺序就是附件 1…%d（标了［附件N］的那条就是它）】"
+                             % len(hist_imgs))
+                lines.append("本条消息时间：%s。历史图虽然可见，并不等于本条消息在请你评价它。"
+                             % time.strftime("%H:%M:%S", time.localtime(now)))
+                for _k, (_p, _w, _t) in enumerate(hist_imgs, 1):
+                    lines.append("附件%d = %s 在 %s 发的图（距本条约 %d 秒）"
+                                 % (_k, _w, time.strftime("%H:%M:%S", time.localtime(_t)),
+                                    max(0, int(now - _t))))
+                lines.append("先回应本条消息。只有当本条没有明确指向那张历史图，且图只是与本条话题无关的"
+                             "情绪或状态表达时，才不要在回复中谈图；否则可自然结合图来回答。"
+                             "时间间隔只作判断线索，不能单独决定是否谈图。")
             if not lines:
                 return
             request.system_prompt = ((request.system_prompt or "") + chr(10)
                                      + chr(10).join(lines))
-            logger.info("[mindscape_groupctx] 注入 self=%s 群=%s 历史=%d 条",
-                        event.get_self_id(), gid, len(recs))
+            if hist_imgs:
+                try:
+                    urls = getattr(request, "image_urls", None)
+                    if urls is None:
+                        urls = []
+                        request.image_urls = urls
+                    for _p, _w, _t in hist_imgs:
+                        if _p not in urls:
+                            urls.append(_p)
+                except Exception as exc:
+                    logger.warning("[mindscape_groupctx] 历史图挂载失败: %s", str(exc)[:120])
+            logger.info("[mindscape_groupctx] 注入 self=%s 群=%s 历史=%d 条 引用=%s 历史图=%d",
+                        event.get_self_id(), gid, len(recs),
+                        ("自己发的图" if (q_quoted and q_img and q_mine) else
+                         "别人的图" if (q_quoted and q_img) else "无"),
+                        len(hist_imgs))
         except Exception as exc:
             logger.warning("[mindscape_groupctx] 注入失败: %s", str(exc)[:120])
 
@@ -3359,10 +3829,112 @@ class TraceMixin:
                 logger.info(line, *args)
         except Exception as e:
             logger.warning("[mindscape_trace] 记录耗时失败: %s", str(e)[:120])
+
+
+class MentionMixin:
+    def setup(self, context):
+        self.mn_on, self.mn_targets = mn_load_config()
+        self.mn_last = {}
+        logger.info("[mindscape_mention] loaded | enabled=%s | targets=%s | 节流=%ds",
+                    self.mn_on, self.mn_targets or "全部", MN_THROTTLE)
+        scope_warn(logger, "mindscape_mention", self.mn_targets, self.mn_on)
+        try:      # 诊断：到底注册了哪些 decorating 钩子、什么顺序
+            import astrbot.core.star.star_handler as _sh
+            _hs = [(h.handler_name, getattr(h, "extras_configs", {}).get("priority"))
+                   for h in _sh.star_handlers_registry.get_handlers_by_event_type(
+                       _sh.EventType.OnDecoratingResultEvent, only_activated=False)]
+            logger.info("[mindscape_mention] decorating 钩子清单(%d): %s", len(_hs), _hs)
+        except Exception as _exc:
+            logger.warning("[mindscape_mention] 钩子清单读取失败: %s", str(_exc)[:120])
+
+    def mn_hit(self, event):
+        return self.mn_on and scope_hit(self.mn_targets, event.get_self_id())
+
+    async def mn_members(self, event, gid):
+        """群成员表：先吃群缓冲（便宜），再问 OneBot 要全量名单。"""
+        out, seen = [], set()
+
+        def _add(uid, nick, card=""):
+            uid = str(uid or "").strip()
+            if not uid or uid in seen:
+                return
+            seen.add(uid)
+            out.append({"user_id": uid, "nickname": str(nick or ""),
+                        "card": str(card or "")})
+
+        rd = globals().get("gc_read_recent")
+        gt = globals().get("gc_buffer_path")
+        if rd and gt:
+            try:
+                for r in rd(gt(cfg.section("groupctx")), event.get_platform_name(),
+                            str(gid), MN_BUF_LIMIT, MN_BUF_WINDOW, MN_BUF_TAIL):
+                    _add(r.get("uid"), r.get("who"))
+            except Exception:
+                pass
+        try:
+            bot = getattr(event, "bot", None)
+            if bot is not None:
+                data = await bot.call_action("get_group_member_list", group_id=int(gid))
+                for m in (data or []):
+                    if isinstance(m, dict):
+                        _add(m.get("user_id"), m.get("nickname"), m.get("card"))
+        except Exception as exc:
+            logger.warning("[mindscape_mention] 取群成员失败: %s", str(exc)[:100])
+        return out
+
+    @llm_tool(name="at_user")
+    async def at_user(self, *args, **kwargs):
+        """真的 @ 一个人（发出去是**会响的提醒**，不是正文里打「@某某」四个字符）。
+
+        **@ 会自动加在你这条回复的最前面** —— 所以紧接着把想说的话写出来就行（「@某某 你说的那句话…」）；
+        不想说别的也可以，那就只发一个 @。
+
+        什么时候用：有人明确让你「@ 一下 / 艾特一下 / 点名」某人，或者你自己真想喊谁过来看。
+        什么时候别用：只是嘴上提到某人、群里闲聊 —— 那种直接用嘴说；一次只点一个人，别连点。
+
+        Args:
+            who(string): 要点的人 —— 群里的名字（昵称 / 群名片），或者直接给 QQ 号。
+        """
+        ev = None
+        for a in args:
+            if hasattr(a, "get_self_id"):
+                ev = a
+                break
+        if ev is None:
+            return "现在点不了名"
+        try:
+            if not self.mn_hit(ev):
+                return "现在不方便点名"
+        except Exception:
+            pass
+        try:
+            gid = ev.get_group_id()
+        except Exception:
+            gid = None
+        if gid is None:
+            return "私聊里没有「@」这回事，直接说话就行"
+        who = str(kwargs.get("who") or "").strip()
+        if not who:
+            return "要点谁？给个名字或者号"
+        # 键用稳定字段：跨钩子拿到的 event 不保证同源（这条坑我们踩过），
+        # 用 unified_msg_origin 会在响应侧对不上。self_id + 群号 就稳。
+        key = "%s|%s" % (ev.get_self_id(), gid)
+        now = time.time()
+        if now - float(self.mn_last.get(key) or 0) < MN_THROTTLE:
+            return "刚点过一次，等一会儿再点"
+        members = await self.mn_members(ev, gid)
+        qq, name = mn_match_member(who, members)
+        if not qq:
+            return "群里没找到「%s」这个人" % who[:20]
+        self.mn_last[key] = now
+        MN_PENDING[key] = (qq, name, now)
+        logger.info("[mindscape_mention] 点名排队 self=%s 群=%s who=%s -> qq=%s key=%s obj=%s id=%s",
+                    ev.get_self_id(), gid, who[:16], qq, key, type(self).__name__, id(self))
+        return "点名排上了：它会加在你**这条回复的最前面** —— 接着把想说的话写完就行；不想多说，那就只发这个 @。"
 # ==================================================================
 # 插件入口：把所有 Mixin 的钩子收进同一个类
 # ==================================================================
-class MindscapePlugin(BlockMixin, GuardMixin, MemoryMixin, StickersMixin, StickerUseMixin, FormatMixin, RescueMixin, SilenceMixin, VisionMixin, GroupctxMixin, TraceMixin, star.Star):
+class MindscapePlugin(BlockMixin, GuardMixin, MemoryMixin, StickersMixin, StickerUseMixin, FormatMixin, RescueMixin, SilenceMixin, VisionMixin, GroupctxMixin, TraceMixin, MentionMixin, star.Star):
     def __init__(self, context):
         self.context = context
         self.name = "mindscape"
@@ -3378,4 +3950,5 @@ class MindscapePlugin(BlockMixin, GuardMixin, MemoryMixin, StickersMixin, Sticke
         VisionMixin.setup(self, context)
         GroupctxMixin.setup(self, context)
         TraceMixin.setup(self, context)
-        logger.info("[mindscape] 插件已加载（11 个模块）")
+        MentionMixin.setup(self, context)
+        logger.info("[mindscape] 插件已加载（12 个模块）")
