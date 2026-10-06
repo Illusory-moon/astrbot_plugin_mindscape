@@ -4,6 +4,7 @@
 源码: plugins/    重新生成: python scripts/build_plugin.py
 """
 
+import asyncio
 import base64
 import datetime
 import hashlib
@@ -415,8 +416,9 @@ def gc_head(event):
     if reason == "mention":
         return "本条消息【没有 @ 你，但提到了你的名字】—— 大概率是在说你，可以应。"
     return ("本条消息【既没有 @ 你，也没有提到你的名字】—— 它多半是群友之间的对话，"
-            "不是对你说的。可以接一句轻量的补充，但不是必须；不要把它当成在问你，"
-            "也不要替别人回答。")
+            "**不是对你说的**。要么不说；要说就只接一句【跟他们在聊的那件事有关】的话"
+            "（附和、吐槽、递个梗都行），**别把话头拐回自己身上**、别借机汇报自己、也别替别人回答。"
+            "不要把它当成在问你。")
 
 
 def gc_quote(event):
@@ -747,6 +749,67 @@ def is_error_text(text, patterns=None, regex=None):
     except re.error:
         pass
     return False
+
+
+MS_SENDTOOL_FLAG = "_ms_sendtool_patched"
+
+
+MS_LINE_GAP = 0.8          # 连发之间的停顿（秒）—— 真人也是一句一句敲的
+
+
+def ms_patch_send_tool():
+    """把内置工具 `send_message_to_user` 改成「每个 plain 各发一条」。
+
+    实测（2026-10-06）：她和主人想连发短句时都爱用这个内置工具，而它把 components
+    拼成一个 MessageChain **一次**发出去 —— 群里只看到一条「火火兔 花花菇 嘻，测完就去睡呀」，
+    三段并成一句。规矩层劝不动、工具说明也劝不动，那就直接改它
+    （能用代码硬保证的，别指望提示词）。逐条发、之间停 MS_LINE_GAP 秒；
+    带非纯文本（图/语音/文件）或指定别的 session 的场景，原样交给原实现。
+    """
+    try:
+        from astrbot.core.tools.message_tools import SendMessageToUserTool
+    except Exception as e:
+        logger.warning("[mindscape_guard] 拿不到内置发送工具，跳过补丁: %s", type(e).__name__)
+        return 0
+    if getattr(SendMessageToUserTool, MS_SENDTOOL_FLAG, False):
+        return 0
+    orig = SendMessageToUserTool.call
+
+    async def _ms_send_to_user(self, context, *args, **kwargs):
+        msgs = kwargs.get("messages")
+        if msgs is None and args:
+            msgs = args[0]
+        if isinstance(msgs, (list, tuple)) and len(msgs) > 1:
+            plains = [m for m in msgs if isinstance(m, dict)
+                      and str(m.get("type")) == "plain"
+                      and str(m.get("text") or "").strip()]
+            others = [m for m in msgs
+                      if not (isinstance(m, dict) and str(m.get("type")) == "plain")]
+            if len(plains) > 1 and not others:
+                rest = {k: v for k, v in kwargs.items() if k != "messages"}
+                tail = tuple(args[1:]) if args else ()
+                n = 0
+                for m in plains:
+                    try:
+                        if tail:
+                            await orig(self, context, [m], *tail, **rest)
+                        else:
+                            await orig(self, context, messages=[m], **rest)
+                        n += 1
+                    except Exception as exc:
+                        logger.warning("[mindscape_guard] 逐条发送第 %d 条失败: %s",
+                                       n + 1, str(exc)[:80])
+                        break
+                    await asyncio.sleep(MS_LINE_GAP)
+                logger.info("[mindscape_guard] 内置工具逐条发送 %d 条（原本 %d 段会并成一条）",
+                            n, len(plains))
+                return "Already sent %d separate messages." % n
+        return await orig(self, context, *args, **kwargs)
+
+    SendMessageToUserTool.call = _ms_send_to_user
+    setattr(SendMessageToUserTool, MS_SENDTOOL_FLAG, True)
+    logger.info("[mindscape_guard] 内置 send_message_to_user 已改成逐条发送")
+    return 1
 
 
 SI_DEFAULT_TOKEN = "[[silence]]"
@@ -1193,7 +1256,8 @@ def search_diary(path, keyword, limit=DEFAULT_LIMIT, scan_lines=SCAN_LINE_CAP,
     为什么要接受多个词：提问用的词往往不是记日记时用的词。实测同一件事换个
     说法，命中数量能差近十倍。所以关键词允许给一组近义词，命中任意一个都算。
     """
-    if not path or not os.path.exists(path):
+    paths = [path] if isinstance(path, str) else list(path or [])
+    if not paths:
         return [], 0
     terms = split_terms(keyword)
     if not terms:
@@ -1205,38 +1269,37 @@ def search_diary(path, keyword, limit=DEFAULT_LIMIT, scan_lines=SCAN_LINE_CAP,
     wants = [d for d in (date_filter(t) for t in terms) if d]
     words = [t for t in terms if date_filter(t) is None]
     scored = []
-    head = ""
     n = 0
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            n += 1
-            if n > scan_lines:
-                break
-            line = line.rstrip()
-            if line.startswith("## "):
-                head = line[3:].strip()
-                continue
-            if not line.startswith("-"):
-                continue
-            body = line.lstrip("- ").strip()
-            text = head + " " + body
-            if wants:
-                # 日期以【条目头】为准：正文里提到别的日期不算
-                ld = date_key(head) or date_key(body)
-                if not any(date_match(ld, w) for w in wants):
+    for source in paths:
+        if not source or not os.path.exists(source):
+            continue
+        head = ""
+        with open(source, "r", encoding="utf-8", errors="replace") as f:
+            for scanned, line in enumerate(f, 1):
+                if scanned > scan_lines:
+                    break
+                n += 1
+                line = line.rstrip()
+                if line.startswith("## "):
+                    head = line[3:].strip()
                     continue
-            if words:
-                per = [score_line(text, t) for t in words]
-                hit = sum(1 for s in per if s > 0)
-                if not hit:
+                if not line.startswith("-"):
                     continue
-                # 命中词数优先，其次才是单词语义分。
-                # 旧实现取 max()：只沾 1 个词和沾满 5 个词同分，于是同分按行号倒序，
-                # 最新的永远排最前，旧事全被挤到 80 条之外。
-                sc = hit * 100.0 + (max(per) if per else 0.0)
-            else:
-                sc = 100.0
-            scored.append((sc, n, "[%s] %s" % (head, body)))
+                body = line.lstrip("- ").strip()
+                text = head + " " + body
+                if wants:
+                    ld = date_key(head) or date_key(body)
+                    if not any(date_match(ld, w) for w in wants):
+                        continue
+                if words:
+                    per = [score_line(text, t) for t in words]
+                    hit = sum(1 for s in per if s > 0)
+                    if not hit:
+                        continue
+                    sc = hit * 100.0 + max(per)
+                else:
+                    sc = 100.0
+                scored.append((sc, n, "[%s] %s" % (head, body)))
     if not scored:
         return [], 0
     # 先按分数降序；同分时越新越靠前
@@ -1306,7 +1369,8 @@ async def recall_memory(*args, **kwargs):
     当问题指的是更早的时间（以前、上次、第一次、这几天），或者你打算回答
     「只有」「就这些」「没有」的时候，都必须先用这个工具查一遍再开口。
 
-    返回的是你当时记下的原话，可以自然地讲出来，别照本宣科念。
+    返回的是你当时记下的原话（**也包括你自己以前在群里说过的话** ✓），
+    可以自然地讲出来，别照本宣科念。
 
     Args:
         keyword(string): 搜索关键词。可以给**一组近义词**，用空格或逗号分开
@@ -1331,10 +1395,13 @@ async def recall_memory(*args, **kwargs):
     except Exception:
         sid = ""
     path = _diary_for(sid)
-    if not path:
+    # 日记 + 发言档案（她自己以前说过的话）一起翻 ——
+    # 会话里只留最近几条，所以「我上次说过什么」必须来档案里找 ✓。
+    paths = ([path] if path else []) + rc_archives(sid)
+    if not paths:
         return "我还没有长期记忆文件。"
     full = _as_bool(kwargs.get("full"))
-    hits, total = search_diary(path, kw, full=full)
+    hits, total = search_diary(paths, kw, full=full)
     if not hits:
         # 找不到就明确说找不到 —— 这是防幻觉的第一道闸
         return ("翻了翻记忆，没有找到跟「%s」有关的记录。"
@@ -1342,6 +1409,37 @@ async def recall_memory(*args, **kwargs):
                 "或者那件事里的另一个说法）；如果还是没有，就直接说你想不起来了，"
                 "不要编。") % kw
     return format_hits(kw, hits, total, full)
+
+
+def rc_archives(self_id):
+    """这个 bot 的「发言档案」文件 —— 她自己以前说过的话（按群归档、原样保存）。
+
+    档案是 janitor 搬出来的（会话里只留最近几条，免得她照着自己的旧口气抄），
+    所以她要看自己说过什么，就来这里翻 ✓。路径与归属都由 `archive.targets` 配 ✓。
+    """
+    out = []
+    for t in (cfg.section("archive") or {}).get("targets") or []:
+        if not isinstance(t, dict):
+            continue
+        if str(t.get("self_id") or "") != str(self_id):
+            continue
+        p = str(t.get("file") or "")
+        if p and not os.path.isabs(p):
+            p = os.path.join(os.path.dirname(cfg.config_path()), p)
+        if p and os.path.exists(p):
+            out.append(p)
+    # 顺带把「额外记忆文件」（extra_diaries：人格档案、私聊日记这类）也纳入检索 ✓ ——
+    # 它们平时是整份注入的，但问到细节（「你上次私聊我说了什么」）还得靠检索 ✓。
+    for b in _bot_entries():
+        if str(b.get("self_id", "")) != str(self_id):
+            continue
+        for x in (b.get("extra_diaries") or []):
+            p = str(x or "")
+            if p and not os.path.isabs(p):
+                p = os.path.join(os.path.dirname(cfg.config_path()), p)
+            if p and os.path.exists(p) and p not in out:
+                out.append(p)
+    return out
 
 
 def rc_knowledge_for(self_id):
@@ -1499,7 +1597,9 @@ def upsert_note(text, key, value):
     刚改过的条目一定进得去。
     """
     key = (key or "").strip()
-    value = (value or "").strip()
+    if not key or len(key) > 40 or any(c in key for c in ":：\r\n"):
+        raise ValueError("note key must be 1-40 characters without colon or newline")
+    value = " ".join((value or "").splitlines()).strip()
     lines = [l for l in (text or "").splitlines()]
     head = [l for l in lines if not LINE_RE.match(l.strip())]
     items = [(k, v) for k, v in parse_notes(text) if k != key]
@@ -1553,6 +1653,8 @@ async def save_note(*args, **kwargs):
         return "要记什么？给我一个名字和内容。"
     if not key:
         key = value[:12]
+    if not key or len(key) > 40 or any(c in key for c in ":：\r\n"):
+        return "名字请控制在 40 字以内，不要带冒号或换行。"
     sid = _find_self_id(args)
     path = notes_path(sid)
     if not path:
@@ -1582,6 +1684,11 @@ DEFAULT_PERSONA = (
     "注意：只记「别人说了什么、发生了什么有趣的事、谁和谁怎么了」，"
     "绝对不要去分析、模仿或总结任何人的说话风格。"
     "用第一人称、短句、轻松的语气写，每条一两句话。"
+    # 记忆按群分房（2026-10-06 主人裁定）：模型在生成时**看得到**每条记录来自哪个群，
+    # 只是以前没要求它写下来 → 存进日记后来源就丢了，注入时自然分不清是哪群的事。
+    "每条日记前面用【群名】标出这件事发生在哪个群（群名在记录的方括号里）。"
+    "方括号里写「私聊」的，就是一对一私聊、不是群 —— 照写「【私聊】」就好，别自己编群名。"
+    "同一个群的条目排在一起，绝不把两个群的事混进同一句。"
     '只输出一个 JSON 对象，格式：'
     '{"diary":["条目1","条目2"], "people":{"昵称":"一句话描述"}}'
     "diary：每条一句话，最多6条，没有值得记的就输出空数组。"
@@ -1634,6 +1741,10 @@ def save_state(path, st):
 
 
 def fetch(src, target, since_ts, since_seq, only_user=None):
+    # target 可以带自己的 source（db/table/where/fields）—— 顶层那份是默认 ✓。
+    # 用途：同一个源库里，群消息和私聊是两个 event_name（group_message / private_message），
+    # 想各写一份日记，就得能按 target 换 where ✓（2026-10-06 加）。
+    src = ((target or {}).get("source") or src) or {}
     """从 SQLite 增量读取消息（表名/字段名来自配置）。
 
     only_user：只取这个 user_id 的消息（mindscape_learn 用它学某人的风格）。
@@ -1693,6 +1804,9 @@ def fetch(src, target, since_ts, since_seq, only_user=None):
     return rows
 
 
+DM_LABEL = "私聊"
+
+
 def dy_render(msgs):
     """把一批消息渲染成发给模型的那段文本。
 
@@ -1700,7 +1814,7 @@ def dy_render(msgs):
     两边不一致就会出现「按 5000 字分好批、发出去却是 6000 字被砍」。
     """
     return "群聊记录：\n" + "\n".join(
-        "[" + m["time"] + "][" + m["gname"] + "] " + m["who"] + ": " + m["txt"]
+        "[" + m["time"] + "][" + (m.get("gname") or DM_LABEL) + "] " + m["who"] + ": " + m["txt"]
         for m in msgs)
 
 
@@ -2446,7 +2560,13 @@ MN_BUF_TAIL = 512 * 1024
 MN_PENDING_TTL = 120       # 排队的 @ 最多等这么久（跨轮了就丢掉，别挂到下一句去）
 
 
-MN_HOOK_PRIORITY = 100     # on_decorating_result：跑在 guard(999) 之后
+MN_HOOK_PRIORITY = 100
+
+
+MN_LINES_MAX = 3          # 连发工具一次最多几条（真人也顶多连发两三句）
+
+
+MN_LINE_GAP = 0.8         # 连发之间的停顿（秒）—— 真人也是一句一句敲的     # on_decorating_result：跑在 guard(999) 之后
 
 
 def mn_load_config():
@@ -2486,6 +2606,45 @@ def mn_match_member(who, members):
     return "", ""
 
 
+def mn_line_chain(text):
+    """把一段纯文本包成 MessageChain。
+
+    `event.send()` 的签名是 `send(message: MessageChain)` —— 传字符串会炸
+    （实测 2026-10-06：她调 say_lines 三次，全都是 `'str' object has no attribute 'chain'`）。
+    路径随版本变，兜两层。"""
+    for mod_path in ('astrbot.api.message_components', 'astrbot.core.message.components'):
+        try:
+            mod = __import__(mod_path, fromlist=['Plain', 'MessageChain'])
+            plain = getattr(mod, 'Plain')
+            chain = getattr(mod, 'MessageChain', None)
+            if chain is None:
+                from astrbot.core.message.message_event_result import MessageChain as chain
+            return chain([plain(text)])
+        except Exception:
+            continue
+    return None
+
+
+def mn_clean_chain(chain, qq=None, name=None):
+    """把正文里**手打的 @** 清掉（@ 已经由 At 组件负责 ✓）。
+
+    两类都清：① `@昵称(123456)`（号会外泄 ✗）② 紧接着真 @ 的那份纯文本 `@昵称`
+    （否则名字出现两遍 ✗）。返回改动次数。
+    """
+    n = 0
+    for comp in chain or []:
+        txt = getattr(comp, "text", None)
+        if not isinstance(txt, str) or "@" not in txt:
+            continue
+        new = MN_AT_LITERAL.sub("", txt)
+        if name:
+            new = re.sub(r"^\s*@" + re.escape(str(name)) + r"\s*", "", new)
+        if new != txt:
+            comp.text = new
+            n += 1
+    return n
+
+
 def mn_take_pending(pending, key, now, ttl=MN_PENDING_TTL):
     """取出一条排队的点名（过期的丢掉）→ (qq, name) 或 None。纯函数，自检直接跑。"""
     item = (pending or {}).pop(key, None)
@@ -2503,6 +2662,15 @@ def mn_take_pending(pending, key, now, ttl=MN_PENDING_TTL):
 MN_PENDING = {}
 
 
+MN_SAID = {}
+
+
+MN_SAID_TTL = 300
+
+
+MN_AT_LITERAL = re.compile(r"@[^\s@()（）]{1,24}[（(]\d{5,12}[)）]")
+
+
 @filter.on_decorating_result(priority=MN_HOOK_PRIORITY)
 async def mn_attach_hook(*args, **kwargs):
     """把排队的 @ 插到这条回复的**最前面**；这轮没正文就单独发一个 @。
@@ -2517,10 +2685,31 @@ async def mn_attach_hook(*args, **kwargs):
             if hasattr(a, "get_self_id"):
                 event = a
                 break
-        if event is None or not MN_PENDING:
+        if event is None:
             return
         key = "%s|%s" % (event.get_self_id(), event.get_group_id())
-        item = mn_take_pending(MN_PENDING, key, time.time())
+        item = mn_take_pending(MN_PENDING, key, time.time()) if MN_PENDING else None
+        said = MN_SAID.pop(key, None) if MN_SAID else None
+        if said and time.time() - float(said[1]) > MN_SAID_TTL:
+            said = None
+        enabled, targets = mn_load_config()
+        if enabled and scope_hit(targets, event.get_self_id()):
+            result = event.get_result()
+            chain = getattr(result, "chain", None) if result is not None else None
+            if chain:
+                removed = mn_clean_chain(chain, (item or (None, None))[0],
+                                         (item or (None, None))[1])
+                if removed:
+                    logger.info("[mindscape_mention] 清掉正文里手打的 @ %d 处", removed)
+        if item is None and said is None:
+            return
+        # ① 她这一轮用 say_lines 说过了 → 不再另发正文（要补就该写进 lines 里 ✓）。
+        #    有 @ 排队时不抑制 —— @ 是挂在正文前面的，抑制会把它一起吞掉 ✗。
+        if said is not None and item is None:
+            event.clear_result()
+            logger.info("[mindscape_mention] 本轮已连发 %d 条 → 抑制正文 self=%s",
+                        said[0], event.get_self_id())
+            return
         if not item:
             logger.info("[mindscape_mention] 键对不上，丢弃排队（%s）", key)
             return
@@ -2529,6 +2718,7 @@ async def mn_attach_hook(*args, **kwargs):
         chain = getattr(result, "chain", None) if result is not None else None
         if chain:
             chain.insert(0, At(qq=qq, name=name))
+            mn_clean_chain(chain, qq, name)      # 手打的那份 @ 一并清掉（名字别出现两遍 ✓）
             logger.info("[mindscape_mention] @ 挂在回复前 self=%s qq=%s（带正文）",
                         event.get_self_id(), qq)
         else:
@@ -2586,6 +2776,11 @@ class GuardMixin:
         g = cfg.section("guard")
         self.g_send = True if g.get("send_guard") is None else bool(g.get("send_guard"))
         armed = self._ms_arm_send_guard() if self.g_send else 0
+        try:
+            self.ms_lined = ms_patch_send_tool()
+        except Exception as e:
+            self.ms_lined = 0
+            logger.warning("[mindscape_guard] 逐条发送补丁失败: %s", str(e)[:120])
         logger.info("[mindscape_guard] loaded | %d 条拦截规则 | send 级兜底=%s（本次包了 %d 个类）",
                     len(self.patterns), self.g_send, armed)
 
@@ -3890,6 +4085,8 @@ class MentionMixin:
         不想说别的也可以，那就只发一个 @。
 
         什么时候用：有人明确让你「@ 一下 / 艾特一下 / 点名」某人，或者你自己真想喊谁过来看。
+        ⚠️ 点了名之后，**别再在正文里手打「@某人」**（更不要写「@某人(QQ号)」）——
+        @ 会自动挂在你这条回复的最前面 ✓，正文里直接写你要说的话就行。
         什么时候别用：只是嘴上提到某人、群里闲聊 —— 那种直接用嘴说；一次只点一个人，别连点。
 
         Args:
@@ -3931,6 +4128,98 @@ class MentionMixin:
         logger.info("[mindscape_mention] 点名排队 self=%s 群=%s who=%s -> qq=%s key=%s obj=%s id=%s",
                     ev.get_self_id(), gid, who[:16], qq, key, type(self).__name__, id(self))
         return "点名排上了：它会加在你**这条回复的最前面** —— 接着把想说的话写完就行；不想多说，那就只发这个 @。"
+    @llm_tool(name="say_lines")
+    async def say_lines(self, *args, **kwargs):
+        """一口气连发几条短消息 —— 每条单独成一个气泡（像真人想到一句打一句）。
+
+        一条一句、最多 3 条，按顺序发出去。想先丢一句、再补一句的时候就用它。
+        别用 send_message_to_user 连发：它会把好几条并成一条消息（实测过）。
+
+        Args:
+            lines(array): 要连发的短消息列表，一条一句。
+        """
+        ev = None
+        for a in args:
+            if hasattr(a, "get_self_id"):
+                ev = a
+                break
+        if ev is None:
+            return "现在发不了"
+        try:
+            if not self.mn_hit(ev):
+                return "现在发不了"
+        except Exception:
+            pass
+        raw = kwargs.get("lines")
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, (list, tuple)):
+            return "给我一个字符串列表，一条一句"
+        parse = globals().get("parse_response")
+        fl = globals().get("flatten")
+        dp = globals().get("drop_period")
+        f_c = (cfg.section("format") or {})
+        join_with = f_c.get("join_with") or "，"
+        drop = bool(f_c.get("drop_last_if_short", False))
+        short_len = int(f_c.get("short_len") or 8)
+        no_period = bool(getattr(self, "f_np", None)) and scope_hit(self.f_np, ev.get_self_id())
+        items = []
+        for x in raw:
+            t = str(x or "").strip()
+            if not t:
+                continue
+            if parse:
+                try:
+                    t = (parse(t)[0] or t).strip()
+                except Exception:
+                    pass
+            if fl and scope_hit(getattr(self, "targets", []) or [], ev.get_self_id()):
+                try:
+                    t = fl(t, join_with, drop, short_len)
+                except Exception:
+                    pass
+            if no_period and dp:
+                try:
+                    t = dp(t)
+                except Exception:
+                    pass
+            t = t.strip()
+            if t:
+                items.append(t[:300])
+            if len(items) >= MN_LINES_MAX:
+                break
+        if not items:
+            return "没有可发的内容"
+        sent = 0
+        for t in items:
+            chain = mn_line_chain(t)
+            if chain is None:
+                logger.warning("[mindscape_mention] 连发失败: 拿不到 MessageChain")
+                break
+            try:
+                await ev.send(chain)          # 一条一次 → 单独气泡；也走 guard 的 send 级兜底
+                sent += 1
+            except Exception as exc:
+                logger.warning("[mindscape_mention] 连发失败: %s", str(exc)[:100])
+                break
+            await asyncio.sleep(MN_LINE_GAP)
+        logger.info("[mindscape_mention] 连发 self=%s 条数=%d/%d",
+                    ev.get_self_id(), sent, len(items))
+        # 失败时给**明确**的回话：以前写「发好了：0 条」自相矛盾 ——
+        # 她（或任何模型）会读成「没东西可发」，而不是「工具坏了」，于是内容整条丢掉（13:39 真丢过一次）。
+        if sent == 0:
+            return "没发出去（这个功能现在有毛病）—— 把想说的话直接写在正文里就行，别绕路。"
+        if sent < len(items):
+            return "只发出去 %d 条（剩下的没发成）—— 剩下的话直接写在正文里。" % sent
+        # 全部成功 → 记一笔，让 decorating 钩子把这一轮的正文抑制掉（同一轮别答两遍 ✓）。
+        try:
+            gid = ev.get_group_id()
+        except Exception:
+            gid = None
+        if gid is not None:
+            MN_SAID["%s|%s" % (ev.get_self_id(), gid)] = (sent, time.time())
+        return ("发好了：%d 条（每条一个气泡）。这一轮要说的话就算说完了 —— "
+                "还想补就写进 lines 里，不用再另发正文。" % sent)
 # ==================================================================
 # 插件入口：把所有 Mixin 的钩子收进同一个类
 # ==================================================================
