@@ -22,6 +22,7 @@ from astrbot.api import llm_tool, logger, star
 from astrbot.api import logger
 from astrbot.api import logger, star
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import filter
 from astrbot.core.message.components import At
 from astrbot.core.message.components import Image
 from astrbot.core.message.message_event_result import MessageEventResult
@@ -1668,12 +1669,30 @@ async def save_note(*args, **kwargs):
         if os.path.exists(path):
             with open(path, encoding="utf-8", errors="replace") as f:
                 old = f.read()
-        write_notes(path, upsert_note(old, key, value))
+        new_text = upsert_note(old, key, value)
+        # ⚠️ 2026-10-07 实测：她 12 秒里把**同一条**记了 6 遍 ✗（回话只说「记下了」✗
+        #    没有「别再记」的信号 ✓）→ 白烧 6 轮、那一轮卡了 24 秒 ✗。
+        #    判据用「写一遍看看会不会变」✓ —— 不变就是已经在了 ✓，格式无关、最稳 ✓。
+        if new_text == old:
+            logger.info("[mindscape_notes] %s 内容重复，跳过重复记账: %s", sid, key)
+            return "这条你**刚刚记过**了，不用再记 —— 直接回答就行。"
+        write_notes(path, new_text)
         logger.info("[mindscape_notes] %s 记下 %s: %s", sid, key, value[:40])
-        return "记下了：%s —— %s" % (key, value)
+        return "记下了：%s —— %s（已入账，**不用再记一遍**）" % (key, value)
     except Exception as e:
         logger.warning("[mindscape_notes] 记账失败: %s", str(e)[:120])
         return "这本账我一时写不进去，先记在心里。"
+
+
+_GFX_JUNK = re.compile(r"<[^<>]{0,24}>")
+
+
+def dy_gname(raw, gid=""):
+    """把群名洗成可安全进 prompt 的短标签（详见上面注释）。"""
+    s = "".join(ch for ch in str(raw or "") if ch.isprintable())
+    s = _GFX_JUNK.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:20] or str(gid or "").strip() or "群聊"
 
 
 DEFAULT_SEG_SYMBOLS = {
@@ -1798,7 +1817,8 @@ def fetch(src, target, since_ts, since_seq, only_user=None):
             sender = (d.get("sender") or {}).get("card") or (d.get("sender") or {}).get("nickname") or uid
             rows.append({
                 "ts": ts, "seq": seq,
-                "gname": str(d.get("group_name", ""))[:20],
+                "gid": gid,
+                "gname": dy_gname(d.get("group_name"), gid),
                 "who": str(sender)[:16], "uid": uid,
                 "time": datetime.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M"),
                 "txt": txt[:200],
@@ -1822,7 +1842,7 @@ def dy_render(msgs):
         for m in msgs)
 
 
-def chunk_by_budget(rows, batch, max_input_chars):
+def chunk_by_budget(rows, batch, max_input_chars, split_group=False):
     """先按条数切、再按【真实渲染长度】细分，保证每条消息都进得了某一次请求。
 
     为什么要这么麻烦：以前是固定 batch 条一组，再在 call_llm 里把文本砍到
@@ -1836,6 +1856,9 @@ def chunk_by_budget(rows, batch, max_input_chars):
     for i in range(0, len(rows), batch):
         cur = []
         for r in rows[i:i + batch]:
+            if split_group and cur and (r.get("gid"), r.get("gname")) != (cur[0].get("gid"), cur[0].get("gname")):
+                out.append(cur)
+                cur = []
             trial = cur + [r]
             if cur and len(dy_render(trial)) > max_input_chars:
                 out.append(cur)
@@ -2066,7 +2089,7 @@ def run_target(d):
         total_read += len(rows)
         all_people = {}
         try:
-            batches = chunk_by_budget(rows, batch, max_in)
+            batches = chunk_by_budget(rows, batch, max_in, split_group=True)
         except ValueError as e:
             # 分不出合法的批：停在原游标，等主人调大 max_input_chars
             print("[mindscape_diary] 分批失败，本轮不动游标: %s" % str(e)[:140])
@@ -2102,8 +2125,12 @@ def run_target(d):
                 with open(out_file, "a", encoding="utf-8") as fp:
                     fp.write("<!-- ms-seq:" + rng + " -->\n")
                     fp.write("## " + stamp + "\n")
+                    label = chunk[0].get("gname") or DM_LABEL
                     for e in entries:
-                        fp.write("- " + str(e) + "\n")
+                        entry = str(e).strip()
+                        if entry.startswith("【") and "】" in entry:
+                            entry = entry.split("】", 1)[1].lstrip()
+                        fp.write("- 【" + label + "】" + entry + "\n")
                     fp.write("\n")
                 total_added += len(entries)
             elif entries:
@@ -2549,6 +2576,23 @@ def tr_usage(resp):
         return ""
 
 
+RC_OUTBOUND_TOOLS = {"send_message_to_user", "say_lines", "at_user"}
+
+
+RC_SENT = {}          # key = "self_id|group_id" → 时间戳 ✓ 跨钩子用模块级（event 存储不可靠 ✓）
+
+
+RC_SENT_TTL = 180
+
+
+def rc_sent_recent(event, now=None):
+    """本轮（近 RC_SENT_TTL 秒）有没有出站类工具发过话。"""
+    import time as _t
+    key = "%s|%s" % (event.get_self_id(), event.get_group_id())
+    ts = RC_SENT.get(key) or 0
+    return (float(now if now is not None else _t.time()) - float(ts)) < RC_SENT_TTL
+
+
 MN_THROTTLE = 15            # 同一会话两次点名之间的最小间隔（秒）
 
 
@@ -2669,7 +2713,10 @@ MN_PENDING = {}
 MN_SAID = {}
 
 
-MN_SAID_TTL = 300
+MN_SAID_TTL = 300       # 状态在表里最多留多久（清理用 ✓）
+
+
+MN_SAID_WINDOW = 40     # 抑制窗口：超过这个秒数且不是同一轮，就不再抑制 ✓（见下方注释 ✓）
 
 
 MN_AT_LITERAL = re.compile(r"@[^\s@()（）]{1,24}[（(]\d{5,12}[)）]")
@@ -2693,9 +2740,18 @@ async def mn_attach_hook(*args, **kwargs):
             return
         key = "%s|%s" % (event.get_self_id(), event.get_group_id())
         item = mn_take_pending(MN_PENDING, key, time.time()) if MN_PENDING else None
-        said = MN_SAID.pop(key, None) if MN_SAID else None
-        if said and time.time() - float(said[1]) > MN_SAID_TTL:
-            said = None
+        # ⚠️ 2026-10-07 实测踩坑：原先这里用 `.pop()` ✗ —— **取一次就没了** ✓，
+        #    而她 say_lines 之后还会继续调工具 ✓，工具循环会**再生成一次正文** ✗ →
+        #    第二次发送时 MN_SAID 已空 ✗ → 那句正文就漏进群了 ✗（群里看到「嗯，那本不属于我~…」✗）。
+        #    改成 `.get()` ✓ 并把**同一轮的 event id** 也记下 ✓；
+        #    只对「同一轮 ✓」或「40 秒内 ✓」生效，免得误伤同一群里**下一轮**的正文 ✗。
+        #    已知上限：同一群 40 秒内开新轮，其正文可能被误抑制 ✓（升级路：换成真正的 turn id ✓）。
+        said = MN_SAID.get(key) if MN_SAID else None
+        if said:
+            _same_turn = (len(said) > 2 and said[2] == id(event))
+            if not _same_turn and (time.time() - float(said[1]) > MN_SAID_WINDOW):
+                said = None
+                MN_SAID.pop(key, None)
         enabled, targets = mn_load_config()
         if enabled and scope_hit(targets, event.get_self_id()):
             result = event.get_result()
@@ -2731,6 +2787,24 @@ async def mn_attach_hook(*args, **kwargs):
                         event.get_self_id(), qq)
     except Exception as exc:
         logger.warning("[mindscape_mention] 挂 @ 失败: %s", str(exc)[:100])
+
+
+def ts_ids(raw):
+    """把配置里的 self_id 列表/字符串归一成集合。"""
+    if isinstance(raw, (list, tuple)):
+        return {str(x).strip() for x in raw if str(x).strip()}
+    return {x for x in re.split(r"[\s,，;；]+", str(raw or "").strip()) if x}
+
+
+def ts_removed_for(allow, self_id):
+    """返回「这个 bot 不该看到的工具名」列表（纯函数 ✓ 好测 ✓）。"""
+    sid = str(self_id or "")
+    out = []
+    for name, allowed in (allow or {}).items():
+        ids = ts_ids(allowed)
+        if ids and sid not in ids:
+            out.append(str(name))
+    return out
 # ==================================================================
 # 命名空间：让 cfg.xxx() / core.xxx() 这类调用在合并后依然可用
 # ==================================================================
@@ -3599,7 +3673,20 @@ class RescueMixin:
                 return
             if getattr(response, "tools_call_name", None):
                 return
+            # ⚠️ 2026-10-07 实测踩坑：她这轮用 say_lines 连发 2 条 ✓，正文被 mention 模块
+            # **主动抑制**掉了 ✓ —— 但这里把「被抑制」当成了「模型没吐字」✗，于是补了一条
+            # **完全不属于她人格**的话发进群 ✗（`tools_call_name` 在这一步还是空的 ✗ 判据形同虚设 ✓）。
+            # 规矩：**本轮只要已经用「出站类工具」说过话，就不许补** ✓（跨钩子状态存模块级 ✓）。
+            if rc_sent_recent(event):
+                logger.info("[mindscape_rescue] 本轮已用工具说过话 → 不补 ✓")
+                return
             text = await self._ask_once(event)
+            if not text:
+                # 补话彻底失败（没 key / 超时 / 报错）→ 至少留一句**可配置**的兜底 ✓，
+                # 免得退化成一次静默的「叫它不理」✗。文案进配置 ✓（代码里不留人格措辞 ✓）。
+                text = str(self.r_cfg.get("fallback_line") or "").strip()
+                if text:
+                    logger.info("[mindscape_rescue] 补话不成，用兜底话术 ✓")
             if text:
                 response.completion_text = text
                 logger.info("[mindscape_rescue] 空回复已补（%s）: %s",
@@ -3619,7 +3706,11 @@ class RescueMixin:
         try:
             sp = getattr(request, "system_prompt", "") or ""
             if sp:
-                event.set_extra("_ms_ctx_prompt", sp[-1400:])
+                # ⚠️ 2026-10-07 实测：只取**尾部** → 拿到的是规矩/记忆/账本 ✗，
+                # **人格在开头** ✓（AstrBot 先写人格 ✓ 各模块往后追加 ✓）→
+                # 于是救援补出来的话毫无人格 ✗（「这俩本来不就是一个人吗」✗）。
+                event.set_extra("_ms_ctx_persona", sp[:1500])   # 头部 = 人格正文 ✓
+                event.set_extra("_ms_ctx_prompt", sp[-1400:])   # 尾部 = 当下守的规矩/记忆 ✓
             rows = []
             for m in (getattr(request, "contexts", None) or [])[-5:]:
                 if not isinstance(m, dict):
@@ -3638,9 +3729,13 @@ class RescueMixin:
 
     @filter.on_using_llm_tool()
     async def rc_capture_sent(self, event: AstrMessageEvent, tool, tool_args):
-        """记下这一轮真正发出去的话 —— 冒泡轮要用它替换任务黑话。"""
+        """记下这一轮真正发出去的话 —— 冒泡轮要用它替换任务黑话；顺便记「这轮已经出站过」✓。"""
         try:
-            if getattr(tool, "name", "") != "send_message_to_user":
+            _name = getattr(tool, "name", "")
+            if _name in RC_OUTBOUND_TOOLS:
+                import time as _t
+                RC_SENT["%s|%s" % (event.get_self_id(), event.get_group_id())] = _t.time()
+            if _name != "send_message_to_user":
                 return
             if not isinstance(tool_args, dict):
                 return
@@ -3695,8 +3790,10 @@ class RescueMixin:
         if not api_base or not key:
             return ""
         # 优先用「这一轮真实的人设/记忆/风格」快照；配置里的 persona 只当兜底
-        persona = (str(event.get_extra("_ms_ctx_prompt") or "").strip()
-                   or self.r_cfg.get("persona") or "一个自然的聊天伙伴")
+        head = str(event.get_extra("_ms_ctx_persona") or "").strip()
+        tail = str(event.get_extra("_ms_ctx_prompt") or "").strip()
+        persona = head or self.r_cfg.get("persona") or "一个自然的聊天伙伴"
+        style_now = tail if (tail and tail != head) else ""
         recent = str(event.get_extra("_ms_ctx_recent") or "").strip()
         last = ""
         try:
@@ -3704,13 +3801,16 @@ class RescueMixin:
             last = str(getattr(data, "message_str", "") or "")[:200]
         except Exception:
             last = ""
+        related = self._identity_memory(event, last)
         prompt = (
-            "下面是你的人设、记忆和说话风格（照着来，不要照抄原文）：\n"
-            + persona
-            + (("\n\n最近几轮对话：\n" + recent) if recent else "")
+            (("下面是你此刻正守着的规矩与记忆（照着来，不要照抄原文）：\n" + style_now + "\n\n")
+             if style_now else "")
+            + (("最近几轮对话（注意「我」是怎么说话的）：\n" + recent) if recent else "")
             + "\n\n刚才对方说了：\n" + (last or "（一条消息）")
+            + (("\n\n关于当前发言者，你记下的往事：\n" + related) if related else "")
             + "\n\n请用你自己的口吻补一句自然的回应（不超过30字）。"
               "不要解释、不要客套、不要提及你是 AI，也不要提你刚才没说话。"
+              "记忆片段不完整；不要因为眼前没有记录就断言不认识对方或没有档案。"
         )
         try:
             async with httpx.AsyncClient(timeout=float(self.r_cfg.get("timeout") or 20)) as cli:
@@ -3718,7 +3818,13 @@ class RescueMixin:
                     api_base + "/chat/completions",
                     headers={"Authorization": "Bearer " + key},
                     json={"model": self.r_cfg.get("model") or "gpt-4o-mini",
-                          "messages": [{"role": "user", "content": prompt}],
+                          "messages": [
+                              # 人格放 **system** ✓（2026-10-07 改：以前全塞 user ✗ 遵从度低 ✓）
+                              {"role": "system",
+                               "content": persona +
+                               "\n\n（补话要求：**用上面这个人物的口吻**说一句 —— 称呼、口癖、句尾习惯都照它来；"
+                               "不超过 30 字；不要客套、不要提 AI、不要提你刚才没说话。）"},
+                              {"role": "user", "content": prompt}],
                           "max_tokens": int(self.r_cfg.get("max_tokens") or 120)},
                 )
             if resp.status_code != 200:
@@ -3733,6 +3839,36 @@ class RescueMixin:
             return txt
         except Exception as e:
             logger.warning("[mindscape_rescue] 补话失败: %s", str(e)[:100])
+            return ""
+
+    @staticmethod
+    def _identity_memory(event, last):
+        if not re.search(r"我是谁|你认识我|还记得我|认得我吗|我叫什么", last):
+            return ""
+        try:
+            sender = getattr(getattr(event, "message_obj", None), "sender", None)
+            name = str(getattr(sender, "nickname", "") or getattr(sender, "name", "") or "").strip()
+            if len(name) < 2:
+                return ""
+            sid = str(event.get_self_id())
+            bot = next((b for b in cfg.bot_entries() if str(b.get("self_id")) == sid), {})
+            paths = list(bot.get("extra_diaries") or []) + [bot.get("diary")]
+            hits = deque(maxlen=4)
+            # ponytail: rare rescue scans files once; reuse recall's index if these files grow large.
+            for path in paths:
+                if not isinstance(path, str) or not path:
+                    continue
+                if not os.path.isabs(path):
+                    path = os.path.join(os.path.dirname(cfg.config_path()), path)
+                if not os.path.isfile(path):
+                    continue
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if line.startswith("- ") and name in line:
+                            hits.append(line.strip())
+            return "\n".join(hits)[:700]
+        except Exception as e:
+            logger.warning("[mindscape_rescue] 身份记忆检索失败: %s", type(e).__name__)
             return ""
 
 
@@ -4221,13 +4357,56 @@ class MentionMixin:
         except Exception:
             gid = None
         if gid is not None:
-            MN_SAID["%s|%s" % (ev.get_self_id(), gid)] = (sent, time.time())
+            MN_SAID["%s|%s" % (ev.get_self_id(), gid)] = (sent, time.time(), id(ev))
         return ("发好了：%d 条（每条一个气泡）。这一轮要说的话就算说完了 —— "
                 "还想补就写进 lines 里，不用再另发正文。" % sent)
+
+
+class ToolscopeMixin:
+    def setup(self, context):
+        try:
+            conf = cfg.section("tool_scope")
+            logger.info("[mindscape_toolscope] loaded | %s | 隔离规则 %d 条",
+                        "启用" if conf.get("enabled", True) else "关闭",
+                        len(conf.get("allow") or {}))
+        except Exception:
+            pass
+
+    @filter.on_llm_request(priority=-30)
+    async def ts_scope_tools(self, event, request):
+        """摘掉不属于当前 bot 的工具（见模块 docstring）。"""
+        try:
+            conf = cfg.section("tool_scope")
+            if not conf.get("enabled", True):
+                return
+            allow = conf.get("allow") or {}
+            if not isinstance(allow, dict) or not allow:
+                return
+            ts = getattr(request, "func_tool", None)
+            if ts is None:
+                return
+            names = ts_removed_for(allow, event.get_self_id())
+            if not names:
+                return
+            have = {getattr(t, "name", "") for t in (getattr(ts, "tools", None) or [])}
+            gone = []
+            for n in names:
+                if n not in have:
+                    continue
+                try:
+                    ts.remove_tool(n)
+                    gone.append(n)
+                except Exception:
+                    pass
+            if gone:
+                logger.info("[mindscape_toolscope] self=%s 摘掉不属于它的工具: %s",
+                            event.get_self_id(), gone)
+        except Exception as e:
+            logger.warning("[mindscape_toolscope] 过滤失败: %s", str(e)[:120])
 # ==================================================================
 # 插件入口：把所有 Mixin 的钩子收进同一个类
 # ==================================================================
-class MindscapePlugin(BlockMixin, GuardMixin, MemoryMixin, StickersMixin, StickerUseMixin, FormatMixin, RescueMixin, SilenceMixin, VisionMixin, GroupctxMixin, TraceMixin, MentionMixin, star.Star):
+class MindscapePlugin(BlockMixin, GuardMixin, MemoryMixin, StickersMixin, StickerUseMixin, FormatMixin, RescueMixin, SilenceMixin, VisionMixin, GroupctxMixin, TraceMixin, MentionMixin, ToolscopeMixin, star.Star):
     def __init__(self, context):
         self.context = context
         self.name = "mindscape"
@@ -4244,4 +4423,5 @@ class MindscapePlugin(BlockMixin, GuardMixin, MemoryMixin, StickersMixin, Sticke
         GroupctxMixin.setup(self, context)
         TraceMixin.setup(self, context)
         MentionMixin.setup(self, context)
-        logger.info("[mindscape] 插件已加载（12 个模块）")
+        ToolscopeMixin.setup(self, context)
+        logger.info("[mindscape] 插件已加载（13 个模块）")

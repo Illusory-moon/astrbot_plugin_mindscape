@@ -68,7 +68,7 @@ git clone https://github.com/Illusory-moon/astrbot_plugin_mindscape.git
 装好后启动日志里应该有：
 
 ```
-[mindscape] 插件已加载（12 个模块）
+[mindscape] 插件已加载（13 个模块）
 ```
 
 ## 配置
