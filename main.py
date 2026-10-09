@@ -9,6 +9,7 @@ import base64
 import datetime
 import hashlib
 import hmac
+import io
 import json
 import logging
 import os
@@ -28,6 +29,8 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event import filter
 from astrbot.core.message.components import At
 from astrbot.core.message.components import Image
+from astrbot.core.message.components import Image, Plain
+from astrbot.core.message.message_event_result import MessageChain, MessageEventResult
 from astrbot.core.message.message_event_result import MessageEventResult
 from astrbot.core.provider.entities import ProviderRequest
 from astrbot.core.star.filter.event_message_type import EventMessageType
@@ -120,6 +123,17 @@ def scope_list(raw):
         if s:
             out.append(s)
     return out
+
+
+PLATFORM_CMD_PREFIXES = ("#", "/")
+
+
+def is_platform_command(text):
+    """这条文本是不是**平台 / 网关指令**（「#sl」之类 ✓）—— 是就别让它进任何上下文或记忆 ✓。"""
+    t = (text or "").lstrip()
+    if not t:
+        return False
+    return t[0] in PLATFORM_CMD_PREFIXES
 
 
 def scope_hit(targets, self_id):
@@ -526,6 +540,10 @@ def gc_read_recent(path, platform, group, limit, window_sec, tail_bytes):
             continue
         if now - float(rec.get("ts") or 0) > window_sec:
             continue
+        # ★ 2026-10-09（主人报 ✓）：平台指令（「#sl」之类 ✗）不进群上下文 ✓ ——
+        #   否则她会把它当成「群友刚说的话」✓ 甚至去回一句 ✗（判据见 core.is_platform_command ✓）。
+        if is_platform_command(rec.get("text")):
+            continue
         out.append(rec)
     return out[-limit:]
 
@@ -544,7 +562,21 @@ def gc_head(event):
     if reply_self:
         return "本条消息【引用了你说过的话】—— 它是接着你的话说的。"
     if reason == "mention":
-        return "本条消息【没有 @ 你，但提到了你的名字】—— 大概率是在说你，可以应。"
+        # ⚠️ 2026-10-08 主人裁定：这一条**不是「可以应」**✗ —— 得让她分清两种情形 ✓。
+        #    实测（10-07/10-08 共 73 组）：群友在聊**游戏机制 / 剧情**（词条 / 伤害占比 / 配队 /
+        #    剧情名词 ✓）时提到她的名字，她每次都读成「在说我这个人」✗ 于是插话 ✗。
+        #    而她的个性是**设定允许的**（知识库《战斗设定》：「她会按主 C 流讲，这是人设不是无知」✓）
+        #    → 所以**不能让她闭嘴** ✗（那是把人格掐了 ✗）—— 要给她的是**边界** ✓：
+        #    「你可以觉得你该是主 c ✓ 但**不能打扰别人的规划** ✗」（主人原话 ✓）。
+        return ("本条消息【没有 @ 你，但提到了你的名字】—— 先分清是哪一种：\n"
+                "① 他们在**叫你**（名字在句首、后面跟着「，」、或带着问句 /「你」）→ 正常回 ✓；\n"
+                "② 他们在**聊你**（你的游戏数据、配队、词条、伤害、剧情）→ 那是在讨论你这个角色 ✓ "
+                "**不是在跟你说话** ✗ —— 这时候你可以有性格 ✓ 但要分清场合：\n"
+                "   · **调侃可以** ✓（自夸、接梗、耍宝，那是你 ✓）；**嘴欠要看时机** ✗。\n"
+                "   · 别人在**认真谈配置 / 规划 / 谁站哪个位置**时 ✗ —— **别去否定别人的方案** ✗。"
+                "你可以觉得你该是主 c ✓ **但不能打扰别人的规划** ✓ —— 别用「我不该站后排」「让她自己来求我」"
+                "这种话去顶掉别人的配队 ✗。\n"
+                "   · 要么不接 ✓；要接就接一句**懂行**的话（你是这个角色 ✓ 游戏里的事你比谁都清楚 ✓）。")
     return ("本条消息【既没有 @ 你，也没有提到你的名字】—— 它多半是群友之间的对话，"
             "**不是对你说的**。要么不说；要说就只接一句【跟他们在聊的那件事有关】的话"
             "（附和、吐槽、递个梗都行），**别把话头拐回自己身上**、别借机汇报自己、也别替别人回答。"
@@ -1062,6 +1094,9 @@ def si_load_config():
 VS_MARK = "这一轮的消息里带了图"
 
 
+VS_LARGE_IMAGE_BYTES = 2_000_000
+
+
 VS_HINT = """## 这一轮的消息里带了图 —— 认人之前先查
 
 - 图里的人物 / 作品，**先用 lookup_knowledge 查，查完还不确定就联网搜**；
@@ -1087,6 +1122,51 @@ def vs_has_image(event):
         if isinstance(c, Image):
             return True
     return False
+
+
+def vs_compact_image(ref):
+    """大图只给模型传静态预览；原始消息和图片不改。"""
+    try:
+        if ref.startswith(("http://", "https://")):
+            with urllib.request.urlopen(urllib.request.Request(
+                    ref, headers={"User-Agent": "Mozilla/5.0"}), timeout=10) as response:
+                size = int(response.headers.get("Content-Length") or 0)
+                if size and size <= VS_LARGE_IMAGE_BYTES:
+                    return None
+                raw = response.read(24_000_001)
+        elif os.path.isfile(ref):
+            if os.path.getsize(ref) <= VS_LARGE_IMAGE_BYTES:
+                return None
+            with open(ref, "rb") as f:
+                raw = f.read(24_000_001)
+        else:
+            return None
+        if not VS_LARGE_IMAGE_BYTES < len(raw) <= 24_000_000:
+            return None
+
+        from PIL import Image as PilImage
+        image = PilImage.open(io.BytesIO(raw))
+        count = getattr(image, "n_frames", 1)
+        frames = []
+        for index in dict.fromkeys((0, count // 2, count - 1)):
+            image.seek(index)
+            frame = image.convert("RGB")
+            frame.thumbnail((768, 768), PilImage.LANCZOS)
+            frames.append(frame)
+        preview = PilImage.new("RGB", (max(f.width for f in frames),
+                                        sum(f.height for f in frames)), "white")
+        top = 0
+        for frame in frames:
+            preview.paste(frame, (0, top))
+            top += frame.height
+        out = io.BytesIO()
+        preview.save(out, "JPEG", quality=80)
+        logger.info("[mindscape_vision] 大图预览 %d -> %d 字节 | 帧=%d",
+                    len(raw), out.tell(), len(frames))
+        return "data:image/jpeg;base64," + base64.b64encode(out.getvalue()).decode("ascii")
+    except Exception as e:
+        logger.warning("[mindscape_vision] 大图预览失败，保留原图: %s", str(e)[:120])
+        return None
 
 
 DEFAULT_MAX_CHARS = 2500
@@ -1854,7 +1934,11 @@ async def save_note(*args, **kwargs):
             return "这条你**刚刚记过**了，不用再记 —— 直接回答就行。"
         write_notes(path, new_text)
         logger.info("[mindscape_notes] %s 记下 %s", sid, key)
-        return "记下了：%s —— %s（已入账，**不用再记一遍**）" % (key, value)
+        # ★ ①（2026-10-09 主人批 ✓）：**成功就返回 None** ✗ —— 账已经记进去了 ✓
+        #   没必要再让模型看一句「记下了」✓ 那会白花一整轮完整上下文的请求 ✗
+        #   （框架对 None 直接 DONE ✓ 见 tool_loop_agent_runner 的 elif resp is None 分支 ✓）
+        #   失败/提示类**照旧返回** ✓ —— 与 say_lines 同一套顺序纪律 ✓
+        return None
     except Exception as e:
         logger.warning("[mindscape_notes] 记账失败: %s", str(e)[:120])
         return "这本账我一时写不进去，先记在心里。"
@@ -2002,6 +2086,10 @@ def fetch(src, target, since_ts, since_seq, only_user=None):
             txt = seg_to_text(d.get("message"), src.get("symbols"))
             if not txt.strip():
                 continue
+            # ★ 2026-10-09（主人报 ✓）：平台指令（「#sl」之类 ✗）不进记忆 / 日记 ✓ ——
+            #   它不是「群友说的话」✓ 记进去只会污染她的记忆与风格学习 ✓。
+            if is_platform_command(txt):
+                continue
             sender = (d.get("sender") or {}).get("card") or (d.get("sender") or {}).get("nickname") or uid
             rows.append({
                 "ts": ts, "seq": seq,
@@ -2105,6 +2193,18 @@ def call_llm(llm, persona, msgs, max_input_chars, max_tokens, relations=None,
     )
     with urllib.request.urlopen(req, timeout=90) as resp:
         out = json.loads(resp.read().decode("utf-8"))
+    # 2026-10-08 加：把**跑批的 token 也记上** ✓ —— 本鱼那个 trace 只看得到**容器内**的调用 ✗，
+    # 而宿主机这批（日记 / 摘要 / 风格）是用 /opt/mindscape/.api_key **直连**的 ✓ 一直不在账上 ✗
+    # （主人问「那一小时 75 万未命中从哪来」✓ 这里是最大的盲区 ✓）。
+    try:
+        _u = out.get("usage") or {}
+        print("[mindscape_diary] LLM 用量: 未命中 %s ｜ 命中缓存 %s ｜ 输出 %s | model=%s"
+              % (_u.get("prompt_cache_miss_tokens", _u.get("prompt_tokens", "?")),
+                 _u.get("prompt_cache_hit_tokens", "?"),
+                 _u.get("completion_tokens", "?"),
+                 out.get("model") or "?"))
+    except Exception:
+        pass
     try:
         parsed = json.loads(out["choices"][0]["message"]["content"])
     except Exception:
@@ -2842,6 +2942,91 @@ def mn_match_member(who, members):
     return "", ""
 
 
+def mn_split_lines(text, limit=None):
+    """把「几句 + |||」拆成气泡列表 ✓（纯函数 ✓ 便于自检 ✓）。
+
+    返回**空列表**表示「不拆」✓ —— 只有真的出现分隔符、且拆出来 ≥2 段才拆 ✓。
+    """
+    if not text or LINE_SEP not in str(text):
+        return []
+    parts = [x.strip() for x in str(text).split(LINE_SEP)]
+    parts = [x for x in parts if x]
+    if len(parts) < 2:
+        return []
+    return parts[:limit or LINE_SEP_MAX]
+
+
+def mn_plain_text(chain):
+    """把 MessageChain 里的**纯文本**拼出来（只看 Plain / 有 text 的组件）✓。
+
+    用途：正文里可能被她写成「几句 + |||」✓ 我们要先**看到那段文本**才能拆 ✓。
+    """
+    try:
+        comps = getattr(chain, "chain", None) or []
+    except Exception:
+        comps = []
+    out = []
+    for c in comps:
+        t = getattr(c, "text", None)
+        if t is None:
+            continue
+        name = type(c).__name__
+        if name in ("Plain", "Text") or hasattr(c, "text"):
+            out.append(str(t))
+    return "".join(out)
+
+
+def mn_sep_fallback(chain):
+    """兜底 ✓：万一拆分那条路没走成 ✗，也不能让群里看到明文分隔符 ✗。
+
+    把每个 Plain 里的 LINE_SEP 换成换行 ✓（读起来正常 ✓ 只是没能拆成多个气泡 ✓）。
+    返回替换处数 ✓。这个函数挂在**已经验证过能跑**的 mn_clean_chain 那条路上 ✓ ——
+    所以它是**最后一道保险** ✓（2026-10-09 真出过一次漏网 ✓）。
+    """
+    n = 0
+    try:
+        comps = getattr(chain, "chain", None) or []
+    except Exception:
+        comps = []
+    for c in comps:
+        t = getattr(c, "text", None)
+        if isinstance(t, str) and LINE_SEP in t:
+            n += t.count(LINE_SEP)
+            try:
+                c.text = t.replace(LINE_SEP, chr(10)).strip()
+            except Exception:
+                pass
+    return n
+
+
+LINE_SEP = "|||"
+
+
+LINE_SEP_MAX = 3          # 最多三条（跟规矩里写的一致 ✓）
+
+
+MN_LAST_TEXT = {}         # key → (正文, 时间戳) ✓
+
+
+MN_LAST_TEXT_TTL = 30     # 秒：超过就别用了 ✓（防止串到下一轮 ✓）
+
+
+@filter.on_llm_response()
+async def mn_remember_response(self, event, response):
+    """记下这一轮 LLM 生成的正文 ✓（给 decorating 钩子里的 D 拆分用 ✓）。"""
+    try:
+        txt = getattr(response, "completion_text", None) or ""
+        if not str(txt).strip():
+            return
+        key = "%s|%s" % (event.get_self_id(), event.get_group_id())
+        # ★ 必须连**这一轮的消息 id**一起记 ✗ —— 只按时间窗口会在下一轮误用上一轮的正文 ✓
+        #   （2026-10-09 13:00 真事故：新一轮 chain 还是空 ✓ 回退到 6 秒前那份 ✗ → 同一段话发了两遍 ✗）
+        _mid = str(getattr(getattr(event, "message_obj", None), "message_id", "") or "")
+        MN_LAST_TEXT[key] = (str(txt), time.time(), _mid)
+    except Exception:
+        pass
+
+
 def mn_line_chain(text):
     """把一段纯文本包成 MessageChain。
 
@@ -2898,13 +3083,10 @@ def mn_take_pending(pending, key, now, ttl=MN_PENDING_TTL):
 MN_PENDING = {}
 
 
-MN_SAID = {}
+MN_SAID = {}            # key = "self_id|群" → (发了什么, 时间, event_id, message_id) ✓
 
 
 MN_SAID_TTL = 300       # 状态在表里最多留多久（清理用 ✓）
-
-
-MN_SAID_WINDOW = 40     # 抑制窗口：超过这个秒数且不是同一轮，就不再抑制 ✓（见下方注释 ✓）
 
 
 MN_AT_LITERAL = re.compile(r"@[^\s@()（）]{1,24}[（(]\d{5,12}[)）]")
@@ -2934,10 +3116,21 @@ async def mn_attach_hook(*args, **kwargs):
         #    改成 `.get()` ✓ 并把**同一轮的 event id** 也记下 ✓；
         #    只对「同一轮 ✓」或「40 秒内 ✓」生效，免得误伤同一群里**下一轮**的正文 ✗。
         #    已知上限：同一群 40 秒内开新轮，其正文可能被误抑制 ✓（升级路：换成真正的 turn id ✓）。
+        # ⚠️ 2026-10-08 **二次踩坑** ✗：**绝不能用时间窗口** ✗ ——
+        #    20:00:42 她刚用 say_lines 说完 ✓ 20:00:57 群里来了**新问题**（「朋克洛德是哪里」✓）
+        #    只隔 **15 秒** ✓ → 上一轮的残留状态把**新一轮的正文**当成"重复"抑制掉了 ✗✗
+        #    → 她那条回答**一个字都没发出去** ✗ 而会话历史里记着"已发出" ✗ → 她还以为讲过了 ✗
+        #    （主人 20:02 报的「她说解释完了但我没看到」就是这个 ✓）。
+        #    正确口径 ✓：**按这一轮的那条消息判** ✓ —— 同一个 event 或同一条 message_id 才算"同一轮" ✓；
+        #    **新消息进来 = 新一轮 → 绝不抑制** ✓。
         said = MN_SAID.get(key) if MN_SAID else None
         if said:
             _same_turn = (len(said) > 2 and said[2] == id(event))
-            if not _same_turn and (time.time() - float(said[1]) > MN_SAID_WINDOW):
+            _same_msg = (len(said) > 3 and said[3]
+                         and str(said[3]) == str(getattr(
+                             getattr(event, "message_obj", None), "message_id", "") or ""))
+            if not (_same_turn or _same_msg):
+                logger.info("[mindscape_mention] 上一条连发状态属于【别的消息】→ 不抑制正文 ✓")
                 said = None
                 MN_SAID.pop(key, None)
         enabled, targets = mn_load_config()
@@ -2949,6 +3142,48 @@ async def mn_attach_hook(*args, **kwargs):
                                          (item or (None, None))[1])
                 if removed:
                     logger.info("[mindscape_mention] 清掉正文里手打的 @ %d 处", removed)
+                _fb = mn_sep_fallback(chain)      # ★ 兜底：漏网的分隔符一律换成换行 ✓
+                if _fb:
+                    logger.warning("[mindscape_mention] 兜底：正文里漏网的分隔符 %d 处 → 换成换行 ✓", _fb)
+        # ★ D 方案（2026-10-09 主人批 ✓）：正文里带 ||| → 拆成多个气泡发 ✓
+        #   只在**没有排队 @** 时走这条路 ✗ —— 有 @ 的话下面那套会把 @ 挂在正文前 ✓
+        #   两件事混在一起容易把 @ 弄丢 ✓ 所以宁可让那种少数情况走老路 ✓。
+        if item is None:
+            _res = event.get_result()
+            _chain = getattr(_res, "chain", None) if _res is not None else None
+            _txt = mn_plain_text(_chain) if _chain else ""
+            # ★ chain 里通常是 0 字（钩子太早 ✗）→ 回退到 on_llm_response 记下的正文 ✓
+            _src = "chain" if LINE_SEP in _txt else "llm"
+            if LINE_SEP not in _txt:
+                _t = MN_LAST_TEXT.get(key)
+                _mid_now = str(getattr(getattr(event, "message_obj", None), "message_id", "") or "")
+                # ★ 只认**这一轮**那份 ✗ —— 没有 id 或不匹配就绝不用 ✓（宁可不拆，也不能重发上一轮 ✓）
+                if (_t and _mid_now and len(_t) > 2 and _t[2] == _mid_now
+                        and (time.time() - _t[1]) < MN_LAST_TEXT_TTL):
+                    _txt = _t[0]
+                else:
+                    _src = "none"
+            logger.info("[mindscape_mention] D 检查: 文本=%d字 含分隔=%s（chain=%s ｜ llm 缓存=%s）",
+                        len(_txt), LINE_SEP in _txt, bool(_chain), _src == "llm")
+            _parts = mn_split_lines(_txt)
+            if _parts:
+                # ⚠️ 顺序很关键：**第一条真的发出去之后**才抑制正文 ✓
+                #   否则一旦发送失败，她就一个字都发不出去（本鱼第一版就是这个顺序，已改）。
+                _sent = 0
+                for _i, _p in enumerate(_parts):
+                    _c2 = mn_line_chain(_p)
+                    if _c2 is None:
+                        logger.warning("[mindscape_mention] 拆气泡失败: 拿不到 MessageChain")
+                        break
+                    await event.send(_c2)
+                    if _sent == 0:
+                        event.clear_result()   # 别让框架把整段（带 ||| 的）原样再发一遍
+                    _sent += 1
+                    if _i < len(_parts) - 1:
+                        await asyncio.sleep(MN_LINE_GAP)
+                logger.info("[mindscape_mention] 按 %s 拆成 %d 条发出 self=%s",
+                            LINE_SEP, _sent, event.get_self_id())
+                return
         if item is None and said is None:
             return
         # ① 她这一轮用 say_lines 说过了 → 不再另发正文（要补就该写进 lines 里 ✓）。
@@ -3184,7 +3419,13 @@ class MemoryMixin:
                 return
 
             old = getattr(request, "system_prompt", "") or ""
-            if SECTION_TITLE in old:
+            _parts = getattr(request, "extra_user_content_parts", None)
+            if _parts is None:
+                _parts = []
+                request.extra_user_content_parts = _parts
+            # 幂等：旧位置（system_prompt）与新位置（parts）都要查 ✓ 免得重复注入 ✗
+            if SECTION_TITLE in old or any(
+                    SECTION_TITLE in str(getattr(p, "text", "")) for p in _parts):
                 return
 
             label = bot.get("name") or "你"
@@ -3196,8 +3437,7 @@ class MemoryMixin:
             # 光靠工具描述不够：它压根没意识到自己需要查。
             # 触发条件刻意只写**抽象类别**（数量/名单/最值/时间指向），不写具体
             # 例子：具体例子永远列不全，而且会把没枚举到的场景整片漏掉。
-            block = (
-                "\n\n" + SECTION_TITLE + "\n"
+            stable = (
                 "以下是你自己记下来的往事，是你亲身经历的，可以自然地提起，"
                 "但不要照本宣科地念，也不要说「根据我的记忆」这种话。\n\n"
                 "**注意：下面只是你最近记下的一部分，不是你的全部记忆。**"
@@ -3217,7 +3457,9 @@ class MemoryMixin:
             # 规矩：每个 bot 自己的行为约束，写在配置里（不进代码，避免把
             # 某个人设特有的规矩硬编码进通用框架）。
             if rules:
-                block += SECTION_RULES + "\n" + "\n".join("- " + r for r in rules) + "\n\n"
+                stable += SECTION_RULES + "\n" + "\n".join("- " + r for r in rules) + "\n\n"
+            request.system_prompt = old + "\n\n" + stable
+            block = "\n\n" + SECTION_TITLE + "\n"
             if notes:
                 block += SECTION_NOTES + "\n" + notes + "\n\n"
             if sty or sty2:
@@ -3257,7 +3499,19 @@ class MemoryMixin:
                     "想到什么就说什么。\n"
                 )
 
-            request.system_prompt = old + block
+            # ⚠️ 2026-10-08（省钱第二刀 ✓ 主人同意 ✓）：记忆内容每 10 分钟可能变化（日记/账本更新）——
+            # 以前它拼在 system_prompt ✗（最前面 ✓）→ 它一变，**后面的整段对话历史全部按全价重算** ✗
+            # （实测：热的时候命中 94~99% ✓ 冷的时候掉到 19~57% ✗ 就是这个原因 ✓）。
+            # 改挂 `extra_user_content_parts` ✓（框架自带的「接在用户消息之后」✓ 与 groupctx 同一招 ✓）
+            # → system_prompt 只放稳定的人格、说明与规矩；易变记忆留在当前用户消息末尾。
+            try:
+                from astrbot.core.agent.message import TextPart
+                _parts.append(TextPart(
+                    text="【下面是系统给你注入的长期记忆 —— 是你自己记下来的，不是对方说的话】" + block))
+            except Exception as e:
+                logger.warning("[mindscape_memory] 挂 extra_user_content_parts 失败"
+                               "（缓存会吃亏），退回 system_prompt: %s", str(e)[:90])
+                request.system_prompt = (request.system_prompt or old) + block
             logger.info("[mindscape_memory] %s 注入 %d 字记忆 / %d 字摘要 / %d 字账本"
                         " / %d 字风格 / %d 字人物",
                         label, len(mem), len(dig), len(notes), len(sty), len(people))
@@ -3643,7 +3897,13 @@ class StickerUseMixin:
                 save_index(self.index_path, idx)
         except Exception as e:
             return "存图失败：" + str(e)[:60]
-        return "收好啦：%s（%s）" % (name, "/".join(tags))
+        # 成功直接确认，再结束工具轮次；返回字符串会多发一次完整上下文请求。
+        try:
+            await event.send(MessageChain([Plain("这张收好啦~")]))
+        except Exception as e:
+            logger.warning("[mindscape_stickers] 已入库，但确认发送失败: %s", str(e)[:120])
+            return "图已保存，但确认消息没发出去。"
+        return None
 
     @llm_tool(name="send_sticker")
     async def send_sticker(self, *args, **kwargs):
@@ -3794,16 +4054,39 @@ class StickerUseMixin:
             return None
 
         low = txt.lower()
+        # ★ ②（2026-10-09 主人报 ✓）：模型说「没有合适的」→ 就**不发** ✗
+        #   以前没有这两句 ✓ 于是模型判「不合适」之后，下面的标签兜底**照样硬塞一张** ✗✗
+        #   （实测：要「跳舞」发了「猪猪 / 陪睡券」两张 ✗ —— 它们的描述里根本没有跳舞 ✓）
+        if any(k in low for k in ("没有合适", "不合适", "都不合适", "没合适的",
+                                  "none", "no suitable", "not suitable")):
+            logger.info("[mindscape_sticker_use] 选图模型判没有合适的 → 不发 ✓")
+            return None
         for it in cands:
             fn = str(it.get("file"))
             if fn and fn.lower() in low:
                 return fn
+        # ★ ①③ 兜底（主人 2026-10-09 报 ✓）：原来**只看标签** ✗ 且**永远塞一张** ✗。现在：
+        #   ① 把**使用描述**也算进分数 ✓（描述写着「适合什么场景」✓ 是最值钱的线索 ✓）
+        #   ③ 同分时**优先**带偏好标签的 ✓（偏好标签写在配置 prefer_tags 里 ✗ 代码里不留名字 ✓）
+        #   ② 分数太低就**不发** ✗（宁可说没有，也不乱给 ✓ AGENTS 那条铁律 ✓）
         best, bs = None, -1.0
         for it in cands:
             sc = match_score(it, reply)
+            sc += 0.6 * match_score({"tags": [str(it.get("desc") or "")]}, reply)
+            _tgs = " ".join(str(x) for x in (it.get("tags") or []))
+            # 偏好标签**按配置里的顺序递减加分** ✓ —— 排在前面的（主人最想要的）得分更高 ✓
+            # （2026-10-09 主人定的优先级：本 bot 自己的 > 旧型号那类 ✓）
+            for _i, _p in enumerate(self.send_cfg.get("prefer_tags") or []):
+                _p = str(_p).strip()
+                if _p and _p in _tgs:
+                    sc += max(0.10, 0.35 - 0.08 * _i)
+                    break
             if sc > bs:
                 bs, best = sc, it
-        return str(best.get("file")) if best else None
+        if best is None or bs < 0.55:
+            logger.info("[mindscape_sticker_use] 兜底分太低(%.2f) → 不发 ✓", bs)
+            return None
+        return str(best.get("file"))
 
 
 class FormatMixin:
@@ -4172,16 +4455,31 @@ class VisionMixin:
 
     @filter.on_llm_request()
     async def vs_hint(self, event: AstrMessageEvent, request):
-        """只在「这一轮真的带了图」时，往系统提示里塞一次提醒。"""
+        """只在「这一轮真的带了图」时，往当前消息里塞一次提醒。"""
         try:
             if not self._vs_hit(event):
                 return
+            urls = getattr(request, "image_urls", None)
+            if urls:
+                for index, ref in enumerate(urls):
+                    preview = await asyncio.to_thread(vs_compact_image, str(ref))
+                    if preview:
+                        urls[index] = preview
             if not vs_has_image(event):
                 return
             old = getattr(request, "system_prompt", "") or ""
-            if VS_MARK in old:
+            parts = getattr(request, "extra_user_content_parts", None)
+            if VS_MARK in old or any(VS_MARK in str(getattr(p, "text", "")) for p in (parts or [])):
                 return
-            request.system_prompt = old + "\n\n" + VS_HINT
+            try:
+                from astrbot.core.agent.message import TextPart
+                if parts is None:
+                    parts = []
+                    request.extra_user_content_parts = parts
+                parts.append(TextPart(text=VS_HINT))
+            except Exception as e:
+                logger.warning("[mindscape_vision] 挂当前消息失败（缓存会吃亏），退回 system_prompt: %s", str(e)[:90])
+                request.system_prompt = old + "\n\n" + VS_HINT
             logger.info("[mindscape_vision] 有图：已提醒先查再认 | bot=%s",
                         event.get_self_id())
         except Exception as e:
@@ -4275,8 +4573,24 @@ class GroupctxMixin:
                              "时间间隔只作判断线索，不能单独决定是否谈图。")
             if not lines:
                 return
-            request.system_prompt = ((request.system_prompt or "") + chr(10)
-                                     + chr(10).join(lines))
+            # ⚠️ 2026-10-08（省钱要省在根上 ✓）：这一整段**每轮都在变**（定向性 + 本群最近聊天 ✗）——
+            # 以前拼进 system_prompt ✗ → 它一变，**后面的整段对话历史全部按全价重算** ✗
+            # （实测缓存命中率只有 34% ✓ 而未命中 ¥2/M vs 命中 ¥0.04/M = 差 **50 倍** ✗✗）。
+            # 改挂到 `extra_user_content_parts` ✓ —— 这是框架自带的「接在用户消息之后」的位置 ✓
+            # （框架自己的 astrbot/group_chat_context.py 就是这么用的 ✓）→ 稳定前缀不再被污染 ✓。
+            try:
+                # 用到处再导入 ✓（模块级导入在测试环境的假 astrbot 里会炸 ✗）
+                from astrbot.core.agent.message import TextPart
+                parts = getattr(request, "extra_user_content_parts", None)
+                if parts is None:
+                    parts = []
+                    request.extra_user_content_parts = parts
+                parts.append(TextPart(text=chr(10).join(lines)))
+            except Exception as e:
+                # 兜底：宁可费钱，不可丢上下文 ✓ —— 但要打警告 ✗（不然缓存没救回来都不知道 ✓）
+                logger.warning("[mindscape_groupctx] 挂 extra_user_content_parts 失败（缓存会吃亏），退回 system_prompt: %s", str(e)[:90])
+                request.system_prompt = ((request.system_prompt or "") + chr(10)
+                                         + chr(10).join(lines))
             if hist_imgs:
                 try:
                     urls = getattr(request, "image_urls", None)
@@ -4569,7 +4883,16 @@ class MentionMixin:
         except Exception:
             gid = None
         if gid is not None:
-            MN_SAID["%s|%s" % (ev.get_self_id(), gid)] = (sent, time.time(), id(ev))
+            MN_SAID["%s|%s" % (ev.get_self_id(), gid)] = (
+        sent, time.time(), id(ev),
+        str(getattr(getattr(ev, "message_obj", None), "message_id", "") or ""))
+        # ★ C（2026-10-09 主人批 ✓）：**全部发成功 → 返回 None** ✓
+        #   框架对此有**专门分支**（tool_loop_agent_runner:1268）：
+        #     `elif resp is None:` → 「Tool 直接请求发送消息给用户」→ `AgentState.DONE` → **直接结束本轮** ✓
+        #   以前返回字符串 ✗ → 框架还要**再问一次模型**才知道「还想不想调工具」✗
+        #   → 而那一轮要重发整段上下文、模型却只回空字（实测一天 122 次 ✗ ≈ 账单一半 ✓）。
+        #   ⚠️ 必须放在**全部成功之后** ✓：失败时仍返回上面那两句话术 ✓（她才知道要补在正文里 ✓）。
+        return None
         return ("发好了：%d 条（每条一个气泡）。这一轮要说的话就算说完了 —— "
                 "还想补就写进 lines 里，不用再另发正文。" % sent)
 
