@@ -19,7 +19,9 @@ import secrets
 import shutil
 import sqlite3
 import struct
+import sys
 import time
+import urllib.error
 import urllib.request
 from astrbot.api import llm_tool, logger
 from astrbot.api import llm_tool, logger, star
@@ -30,6 +32,7 @@ from astrbot.api.event import filter
 from astrbot.core.message.components import At
 from astrbot.core.message.components import Image
 from astrbot.core.message.components import Image, Plain
+from astrbot.core.message.components import Record
 from astrbot.core.message.message_event_result import MessageChain, MessageEventResult
 from astrbot.core.message.message_event_result import MessageEventResult
 from astrbot.core.provider.entities import ProviderRequest
@@ -43,22 +46,66 @@ class IndexLock:
 
     采集插件与导入脚本会同时碰索引，没有锁的话后写的会覆盖先写的。
     拿不到锁就抛错，绝不带旧快照往下写。
+
+    ⚠️ 2026-10-27 修（P2-1）：原来锁文件只写 pid，且**崩溃后没人清理**
+      （`__exit__` 不会跑）⇒ 一次 `os._exit`/断电就让它**永久阻塞**，只能人工删 `.lock` ✗
+      ⇒ 现在锁内容写 `pid + 时间戳`；等到超时后判定**僵尸锁**：
+        pid 已不存在 **或** 时间戳超过 STALE_SECONDS ⇒ 删掉夺锁重试一次 ✓
     """
+    STALE_SECONDS = 600          # 10 分钟：正常写索引远小于这个数
 
     def __init__(self, path, timeout=5.0):
         self.lock = path + ".lock"
         self.timeout = timeout
         self.fd = None
 
+    @staticmethod
+    def _pid_alive(pid):
+        """进程还在不在（跨平台，只做「明显死了」的判断）。"""
+        if pid <= 0:
+            return False
+        try:
+            if os.name == "nt":
+                import subprocess
+                out = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid],
+                                     capture_output=True, text=True, timeout=5).stdout
+                return str(pid) in out
+            os.kill(pid, 0)
+            return True
+        except Exception:
+            return False
+
+    def _is_stale(self):
+        """pid 死了、或锁太旧 ⇒ 僵尸锁。读不出来就当作活锁（宁可等超时也不乱抢 ✓）。"""
+        import time
+        try:
+            with open(self.lock, encoding="utf-8", errors="replace") as f:
+                parts = (f.read() or "").split()
+            pid = int(parts[0]) if parts else 0
+            ts = float(parts[1]) if len(parts) > 1 else 0.0
+        except Exception:
+            return False
+        if ts and (time.time() - ts) > self.STALE_SECONDS:
+            return True
+        return not self._pid_alive(pid)
+
     def __enter__(self):
         import time
         t0 = time.time()
+        stolen = False
         while True:
             try:
                 self.fd = os.open(self.lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.write(self.fd, str(os.getpid()).encode())
+                os.write(self.fd, ("%d %f" % (os.getpid(), time.time())).encode())
                 return self
             except FileExistsError:
+                if not stolen and self._is_stale():
+                    stolen = True
+                    try:
+                        os.remove(self.lock)      # 接管僵尸锁（只抢一次 ✓）
+                        continue
+                    except Exception:
+                        pass
                 if time.time() - t0 > self.timeout:
                     raise RuntimeError("索引被另一个进程占用: " + self.lock)
                 time.sleep(0.2)
@@ -77,13 +124,38 @@ class IndexLock:
 
 
 class _PrivacyLogFilter(logging.Filter):
+    """把日志里的口令替换成 `[口令已隐去]`。
+
+    ⚠️ 2026-10-27 修（P2-2）：原来**每条日志记录**都调 `pg_redact()`，而它内部会
+      遍历每个 bot、**开文件读整份账本**、再跑 4 条正则 ⇒ 全局日志热路径变成磁盘 I/O ✗
+      （bot 越多越慢；而过滤器一旦装上就永不移除）
+    ⇒ 现在：
+      ① `privacy_gate.enabled` 为假 ⇒ **直接短路**，一次文件都不碰 ✓
+      ② 口令带 **30 秒缓存**，键 = (路径, mtime, size) ⇒ 账本没变就复用 ✓
+      ③ 只有真的命中了才改写 record（其余零副作用）
+    """
+    _CACHE_TTL = 30.0
+
     def filter(self, record):
-        message = record.getMessage()
+        try:
+            if not pg_config().get("enabled"):
+                return True
+        except Exception:
+            return True
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        if not message:
+            return True
         clean = pg_redact(message)
         if clean != message:
             record.msg = clean
             record.args = ()
         return True
+# ==== from plugins/mindscape_core.py ====
+
+
 DEFAULT_PROMPT = (
     "看这张图，判断它适不适合当一个「{persona}」用的表情包。\n\n"
     "判断标准：\n"
@@ -104,6 +176,75 @@ PLACEHOLDERS = {
 
 
 IMG_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+
+
+CST_OFFSET_HOURS = 8
+
+
+def now_cst():
+    """北京时间「现在」（naive datetime，UTC+8 硬算）。"""
+    import datetime
+    return datetime.datetime.utcnow() + datetime.timedelta(hours=CST_OFFSET_HOURS)
+
+
+def log_llm_usage(resp_json, sid, model_hint=""):
+    """把一次**直连** LLM 的用量写进账本（2026-10-27 加 · 对账缺口 621/1055 ✗）。
+
+    为什么要它：⑥ 的用量记账是打在容器 `openai_source.py` 上的补丁 ⇒ 只覆盖
+    **走 AstrBot provider** 的调用 ✗；而插件里有 5 处是 `httpx/urllib` **直连** DeepSeek
+    （digest / rescue / sticker_use / stickers / style）⇒ 官方照收钱、本地一个字都不记 ✗
+    （10-26 实测：官方 1055 次，本地只记得 434 次 = 41%）
+
+    做法：跟 ⑥ **同一个文件、同一套字段**（`t/model/sid/miss/hit/out/pid`）⇒ 汇总脚本不用改 ✓
+    失败一律吞掉（记账绝不能影响主流程 ✓）。
+    """
+    import json as _json
+    import os as _os
+    try:
+        u = (resp_json or {}).get("usage") or {}
+        if not u:
+            return False
+        hit = u.get("prompt_cache_hit_tokens")
+        miss = u.get("prompt_cache_miss_tokens")
+        if hit is None and miss is None:
+            # OpenAI 兼容格式：prompt_tokens 里含缓存命中部分
+            total_in = int(u.get("prompt_tokens") or 0)
+            cached = int(((u.get("prompt_tokens_details") or {}).get("cached_tokens")) or 0)
+            hit, miss = cached, max(0, total_in - cached)
+        row = {
+            "t": now_cst().strftime("%Y-%m-%d %H:%M:%S"),
+            "model": str((resp_json or {}).get("model") or model_hint or "?"),
+            "sid": str(sid or "?"),
+            "miss": int(miss or 0),
+            "hit": int(hit or 0),
+            "out": int(u.get("completion_tokens") or 0),
+            "pid": _os.getpid(),
+        }
+        # 数据目录：合并产物里 `data_dir` 是全局 ✓；开发态走 sys.modules 里的 config ✓
+        #   ⚠️ 不写 `cfg.data_dir()` —— core 被 config 反向依赖，R17 会判"蹭别人的全局名" ✗
+        _fn = globals().get("data_dir")
+        if not callable(_fn):
+            _mod = sys.modules.get("mindscape_config")
+            _fn = getattr(_mod, "data_dir", None)
+        base = _fn() if callable(_fn) else _os.path.expanduser("~/.mindscape")
+        path = _os.path.join(base, "mindscape_usage.jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(_json.dumps(row, ensure_ascii=False) + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def today_cst():
+    """北京时间「今天」（date）。"""
+    return now_cst().date()
+
+
+def fmt_cst(ts, fmt="%m-%d %H:%M"):
+    """把**绝对时间戳**按北京时间格式化（给日记/群缓冲渲染用）。"""
+    import datetime
+    return (datetime.datetime.utcfromtimestamp(float(ts))
+            + datetime.timedelta(hours=CST_OFFSET_HOURS)).strftime(fmt)
 
 
 ALL_TOKENS = ("all", "*", "全部", "所有")
@@ -327,6 +468,9 @@ def save_index(path, idx):
     os.replace(tmp, path)
 
 
+# ==== from plugins/mindscape_config.py ====
+
+
 try:                                   # 插件内：日志必须从框架走（插件市场规范）
     from astrbot.api import logger
 except Exception:                      # 命令行脚本：没有框架，跳过日志
@@ -391,13 +535,32 @@ def bot_entries():
     return bots if isinstance(bots, list) else []
 
 
+# ==== from plugins/mindscape_gate.py ====
+
+
 PG_LINE = re.compile(r"^- 口令：([A-Za-z0-9]+) —— 24 小时内有效（至 ([0-9-]+ [0-9:]+)）")
 
 
 PG_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
-PG_ZONE = ZoneInfo("Asia/Shanghai")
+def _pg_zone():
+    """UTC+8 时区对象 —— **不许在 import 时炸**（2026-10-27 修 · P1-4）。
+
+    事故形态：原来是模块级 `PG_ZONE = ZoneInfo("Asia/Shanghai")` ⇒ 在没有 tzdata 的环境
+    （Windows 原生 Python、`python:3.12-slim`、Alpine…）**import 就抛 ZoneInfoNotFoundError**
+    ⇒ `mindscape_gate` 起不来 ⇒ 依赖它的 `mindscape_guard` 也起不来 ⇒ **整个插件加载失败** ✗
+    （实测：自检因此连带红 7 项）
+    ⇒ 现在：优先系统 tz 数据，拿不到就退成**固定 +8 偏移**
+      （本系统只用这一个时区、且中国无夏令时 ⇒ 固定偏移与 ZoneInfo 等价 ✓）
+    """
+    try:
+        return ZoneInfo("Asia/Shanghai")
+    except Exception:
+        return datetime.timezone(datetime.timedelta(hours=8), "Asia/Shanghai")
+
+
+PG_ZONE = _pg_zone()
 
 
 def pg_config():
@@ -477,16 +640,52 @@ def pg_secret_in(self_id, text):
     return bool(code and code.lower() in (text or "").lower())
 
 
-def pg_redact(text):
-    result = str(text)
+_PG_CODE_CACHE = {}          # path -> (mtime, size, code, at)
+
+
+_PG_CODE_TTL = 30.0          # 秒
+
+
+def pg_codes_fast():
+    """各 bot 的当前口令 —— 带 30 秒缓存（2026-10-27 修 · P2-2）。
+
+    为什么：`pg_redact()` 会被挂在**所有 logger 的所有 handler** 上 ⇒ 每条日志都调一次。
+    原来每次都**开文件读整份账本**、再跑正则 ⇒ 日志热路径 = 磁盘 I/O ✗（bot 越多越慢）。
+    ⇒ 这里按 (路径, mtime, size) 缓存 30 秒：账本没变就直接复用 ✓
+      （口令一天才轮换一次，30 秒的滞后对"打码"来说完全够 ✓）
+    """
+    import time
+    now = time.time()
+    codes = []
     for bot in cfg.bot_entries():
-        sid = bot.get("self_id")
-        path = pg_notes(sid)
-        if path and os.path.isfile(path):
+        path = pg_notes(bot.get("self_id"))
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            st = os.stat(path)
+        except Exception:
+            continue
+        hit = _PG_CODE_CACHE.get(path)
+        if hit and hit[0] == st.st_mtime and hit[1] == st.st_size and (now - hit[3]) < _PG_CODE_TTL:
+            if hit[2]:
+                codes.append(hit[2])
+            continue
+        code = ""
+        try:
             with open(path, encoding="utf-8") as stream:
                 code, _ = pg_current(stream.read())
-            if code:
-                result = re.sub(re.escape(code), "[口令已隐去]", result, flags=re.IGNORECASE)
+        except Exception:
+            code = ""
+        _PG_CODE_CACHE[path] = (st.st_mtime, st.st_size, code, now)
+        if code:
+            codes.append(code)
+    return codes
+
+
+def pg_redact(text):
+    result = str(text)
+    for code in pg_codes_fast():
+        result = re.sub(re.escape(code), "[口令已隐去]", result, flags=re.IGNORECASE)
     return result
 
 
@@ -503,6 +702,9 @@ def pg_audit(action, self_id, session="", detail=""):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(fd, "a", encoding="utf-8") as stream:
         stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+# ==== from plugins/mindscape_groupctx.py ====
 
 
 DEFAULT_BUFFER = "/opt/astrbot/data/group_ctx_buffer.jsonl"
@@ -607,11 +809,11 @@ def gc_head(event):
         return "本条消息【引用了你说过的话】—— 它是接着你的话说的。"
     if reason == "mention":
         # ⚠️ 2026-10-08 主人裁定：这一条**不是「可以应」**✗ —— 得让她分清两种情形 ✓。
-        #    实测（10-07/10-08 共 73 组）：群友在聊**游戏机制 / 剧情**（词条 / 伤害占比 / 配队 /
-        #    剧情名词 ✓）时提到她的名字，她每次都读成「在说我这个人」✗ 于是插话 ✗。
-        #    而她的个性是**设定允许的**（知识库《战斗设定》：「她会按主 C 流讲，这是人设不是无知」✓）
-        #    → 所以**不能让她闭嘴** ✗（那是把人格掐了 ✗）—— 要给她的是**边界** ✓：
-        #    「你可以觉得你该是主 c ✓ 但**不能打扰别人的规划** ✗」（主人原话 ✓）。
+        #    实测（10-07/10-08 共 73 组）：群友在聊**某个作品的具体设定**时提到她的名字，
+        #    她每次都读成「在说我这个人」✗ 于是插话 ✗。
+        #    而她那种「爱插一脚」的劲头是**设定允许的** ✓（掐掉就是掐人格 ✗）
+        #    → 所以**不能让她闭嘴** ✗ —— 要给她的是**边界** ✓：
+        #    「你可以觉得自己该站那个位置 ✓ 但**不能打扰别人的规划** ✗」（主人原话 ✓）。
         return ("本条消息【没有 @ 你，但提到了你的名字】—— 先分清是哪一种：\n"
                 "① 他们在**叫你**（名字在句首、后面跟着「，」、或带着问句 /「你」）→ 正常回 ✓；\n"
                 "② 他们在**聊你**（你的游戏数据、配队、词条、伤害、剧情）→ 那是在讨论你这个角色 ✓ "
@@ -784,6 +986,9 @@ async def gc_resolve_ref(ref):
     return ""
 
 
+# ==== from plugins/mindscape_block.py ====
+
+
 BL_PRIORITY = 999
 
 
@@ -797,6 +1002,9 @@ def bl_load_config():
         if sid and users:
             table[sid] = users
     return on, table
+
+
+# ==== from plugins/mindscape_guard.py ====
 
 
 DEFAULT_PATTERNS = [
@@ -824,6 +1032,198 @@ DEFAULT_PATTERNS = [
     "Error Type:",
     "Error Message:",
 ]
+
+
+_LEAK_LT = chr(60)
+
+
+_LEAK_PAT = r"\s*(?:\|+\s*[A-Za-z]*\s*\|+\s*)?/?\s*(?:tool_calls?|function_calls?|invoke|parameter|calls|function)\b"
+
+
+LEAK_RE = re.compile(_LEAK_LT + _LEAK_PAT, re.I)
+
+
+def has_tool_leak(text):
+    """正文里有没有「工具调用标记漏出来」✗（整段都不该发出去）。"""
+    try:
+        return bool(LEAK_RE.search(text or ""))
+    except Exception:
+        return False
+
+
+_MS_TAG_NAMES = ("impression_update", "wish_mood", "wish_grant", "wish_check",
+                 "mood", "impression", "mindscape_meta")
+
+
+_BT = chr(96)          # 反引号
+
+
+PRIV_TAG_FULL = re.compile(r"(?:\[\[|\[|<)(?:impression_update|wish_mood|wish_grant|wish_check|mood|impression|mindscape_meta)(?:\]\]|\]|>)[ \t]*`*[ \t]*\{[^{}]*\}[ \t]*`*[ \t]*(?:\[\[/|\[/|</)(?:impression_update|wish_mood|wish_grant|wish_check|mood|impression|mindscape_meta)(?:\]\]|\]|>)")
+
+
+PRIV_TAG_CLOSE = re.compile(r"(?:\[\[|\[|<)/(?:impression_update|wish_mood|wish_grant|wish_check|mood|impression|mindscape_meta)(?:\]\]|\]|>)")
+
+
+PRIV_TAG_TRUNC = re.compile(r"(?:\[\[|\[|<)(?:impression_update|wish_mood|wish_grant|wish_check|mood|impression|mindscape_meta)(?:\]\]|\]|>)[ \t]*`*[ \t]*\{[^{}]*$")
+
+
+PRIV_TAG_OPENJSON = re.compile(r"(?:\[\[|\[|<)(?:impression_update|wish_mood|wish_grant|wish_check|mood|impression|mindscape_meta)(?:\]\]|\]|>)[ \t]*`*[ \t]*\{[^{}]*\}[ \t]*`*")
+
+
+def put_plain_text(result, text):
+    """把 result.chain 里的**可见文本**整体换成 `text` ✓ 返回改动数。
+
+    做法（照本仓惯例 `comp.text = new` ✓）：把 `text` 写进**第一个可写的文本组件**，
+    其余文本组件清空 ⇒ **图/语音等非文本组件的顺序不受影响** ✓
+    """
+    chain = getattr(result, "chain", None)
+    if not chain:
+        return 0
+    n = 0
+    done = False
+    for comp in chain:
+        cur = getattr(comp, "text", None)
+        if not isinstance(cur, str):
+            continue
+        if not done:
+            if cur != text:
+                comp.text = text
+                n += 1
+            done = True
+        elif cur:
+            comp.text = ""
+            n += 1
+    return n
+
+
+THINK_LEAK = re.compile(
+    r"(?:(?:^|[，,。；;！!？?\n])[ \t]*(?:嗯|哦|欸|哎)[ \t]*，[ \t]*[^\n。！？]{0,30}?(?:标签|格式|format|need format|wish_mood|impression|JSON|json|写完整|写全)|(?:^|[，,。；;！!？?\n])[ \t]*(?:Wait|wait|Need|need|Hmm|hmm)\b[^\n。！？]{0,40}?(?:format|formatting|JSON|json))[^\n。！？]{0,40}$")
+
+
+def strip_private_tags(text):
+    """扒掉**私有标签（含紧跟的 JSON）**与**自述式思考残句** ✓ 返回 (新文本, 改了几处)。
+
+    ⚠️ 只删「标签 + 它自己的 JSON」；**绝不截断她真正要说的话** ✗
+    """
+    if not isinstance(text, str) or not text:
+        return text, 0
+    n = 0
+    out = text
+    for _ in range(6):                      # 多来几轮，防嵌套/残留 ✓
+        before = out
+        out = PRIV_TAG_FULL.sub("", out)
+        out = PRIV_TAG_TRUNC.sub("", out)
+        out = PRIV_TAG_OPENJSON.sub("", out)
+        out = PRIV_TAG_CLOSE.sub("", out)
+        # 思考残句：**只在扒完还剩 ≥2 字时才扒** ✓（否则它把整句吃了 ⇒ 不扒 ✗）
+        _hit = THINK_LEAK.search(out)
+        if _hit and len(out[:_hit.start()].strip()) >= 2:
+            out = out[:_hit.start()]
+        if out == before:
+            break
+    if out != text:
+        n = 1
+    return out.rstrip(), n
+
+
+_SEP3 = chr(124) * 3
+
+
+MD_BOLD = re.compile(r"\*\*([^*\n]+)\*\*")
+
+
+MD_ITAL = re.compile(r"(?<![*\w])\*([^*\n]+)\*(?![*\w])")
+
+
+MD_UNDER = re.compile(r"__([^_\n]+)__")
+
+
+MD_CODE = re.compile(r"`([^`\n]+)`")
+
+
+MD_FENCE = re.compile(r"```[a-zA-Z0-9_+\-]*\n?")
+
+
+MD_HEAD = re.compile(r"^[ \t]*#{1,6}[ \t]*", re.M)
+
+
+MD_QUOTE = re.compile(r"^[ \t]*>[ \t]?", re.M)
+
+
+MD_HYPHEN = re.compile(r"^[ \t]*[-*+][ \t]+", re.M)
+
+
+MD_NUM = re.compile(r"^[ \t]*\d+[.)][ \t]+", re.M)
+
+
+def strip_md_marks(text):
+    """扒掉 markdown **标记**、留下文字 ✓（返回 (新文本, 改了几处)）。
+
+    ⚠️ 只动标记，不动内容 ✓ —— `**今**晚` → `今晚` ✓（她自己要说的就是"今晚"✓）
+    """
+    if not isinstance(text, str) or not text:
+        return text, 0
+    n = 0
+    out = text
+    for pat, rep in ((MD_BOLD, r"\1"), (MD_UNDER, r"\1"), (MD_CODE, r"\1"),
+                     (MD_ITAL, r"\1"), (MD_FENCE, ""), (MD_HEAD, ""),
+                     (MD_QUOTE, ""), (MD_HYPHEN, ""), (MD_NUM, "")):
+        new = pat.sub(rep, out)
+        if new != out:
+            n += 1
+            out = new
+    return out, n
+
+
+JSON_TAIL_OBJ = re.compile(r"[，,、；;]?\s*\{[^{}]{0,500}\}\s*$")
+
+
+JSON_TAIL_BRACE = re.compile(r"[，,、；;]?\s*[}｝]\s*$")
+
+
+def strip_json_junk(text):
+    """扒掉出站文本**尾部**的 JSON 残渣 ⇒ 返回 (新文本, 改了几处) ✓"""
+    if not isinstance(text, str) or not text:
+        return text, 0
+    out, n = text, 0
+    for _ in range(3):
+        before = out
+        out = JSON_TAIL_OBJ.sub("", out)
+        out = JSON_TAIL_BRACE.sub("", out)
+        if out == before:
+            break
+        n += 1
+    if n:
+        logger.warning("[mindscape_guard] 扒掉出站尾部 JSON 残渣，原尾部：%r", text[-40:])
+    return out.rstrip(), n
+
+
+def normalize_outbound(text):
+    """出站总整理：**私有标签/思考** → **`|||` 去掉** → **markdown 标记扒掉** ✓
+
+    返回 (新文本, 改了几处)。做成一个函数是为了**两条出站管线口径一致** ✓
+    """
+    if not isinstance(text, str) or not text:
+        return text, 0
+    hits = 0
+    out, _n1 = strip_private_tags(text)
+    hits += _n1
+    if _SEP3 in out:
+        # ⚠️ 口径（2026-10-17 第二次修正 ✓）：`|||` 是**句间分隔** ⇒
+        #    替换成**空字符**会让两句话**糊在一起** ✗
+        #    真事故：`…别端那些重口味的来凑热闹|||吃饱了赶紧睡…` ⇒ 去空后读成
+        #    「…来凑热闹吃饱了赶紧睡…」✗（主人报「两句之间有点精分」的一部分 ✓）
+        #    ⇒ 改成**换成「，」** ✓：即使拆气泡那条路没走成，群里读到的仍是**通顺的两句** ✓
+        out = out.replace(_SEP3, "，")
+        hits += 1
+    out, _n2 = strip_md_marks(out)
+    hits += _n2
+    out, _n3 = strip_json_junk(out)
+    hits += _n3
+    if "|" in out:                       # 孤立竖线：先只观测（可能是 ||| 被吃掉两个剩的）
+        logger.warning("[mindscape_guard] 出站仍有孤立竖线 %d 个（只观测不改）：%r",
+                       out.count("|"), out[:60])
+    return out, hits
 
 
 DEFAULT_REGEX = r"(?:[A-Za-z_]*Error|[A-Za-z_]*Exception|Timeout|Failed)\s*[:：]"
@@ -904,6 +1304,35 @@ def ms_chain_text(message):
     return "".join(parts)
 
 
+def ms_chain_clean_plain(message):
+    """把 MessageChain 里**每个文本组件**过一遍 normalize_outbound（就地改，返回改了几处）。
+
+    ⚠️ 只碰 Plain（有 .text 的组件），At / Image / 表情一律不动 ✗
+    ⚠️ 为什么必须在 send 级做：`say_lines` 走的是 `ev.send(chain)`，
+       **不经过结果管线** ⇒ decorating 钩子上的整理**看不到它** ✗
+       （2026-11-03 真事故：模型把 `|||` 写进单条 line 里 ⇒ 原样进群 ✗）
+    """
+    if isinstance(message, str):
+        new, n = normalize_outbound(message)
+        return new, n
+    total = 0
+    for c in (getattr(message, "chain", None) or []):
+        txt = getattr(c, "text", None)
+        if not isinstance(txt, str) or not txt:
+            continue
+        try:
+            new, n = normalize_outbound(txt)
+        except Exception:
+            continue
+        if n and new != txt:
+            try:
+                c.text = new          # 就地改：Plain 是可变的
+                total += n
+            except Exception:
+                pass
+    return message, total
+
+
 def ms_install_send_guard(check):
     """给平台事件类的 send 包一层，返回这次包了几个类（幂等）。"""
     try:
@@ -950,6 +1379,14 @@ def ms_install_send_guard(check):
                         "[mindscape_guard] 拦下直接发送的报错（这条不走结果管线）: %s",
                         redact(txt))
                     return None
+            # ⭐ 出站整理（2026-11-03 补）：这条直发路以前**只拦报错、不整理** ✗
+            try:
+                message, _n_clean = ms_chain_clean_plain(message)
+                if _n_clean:
+                    logger.info("[mindscape_guard] 直发整理 self=%s 改了 %d 处（含 ||| / markdown）",
+                                self.get_self_id(), _n_clean)
+            except Exception as _e:
+                logger.warning("[mindscape_guard] 直发整理失败: %s", str(_e)[:100])
             sent = await _orig(self, message, **kw)
             if txt.strip() and private_code:
                 pg_audit("given", self.get_self_id(), self.get_sender_id() or "")
@@ -983,6 +1420,56 @@ MS_SENDTOOL_FLAG = "_ms_sendtool_patched"
 
 
 MS_LINE_GAP = 0.8          # 连发之间的停顿（秒）—— 真人也是一句一句敲的
+
+
+MS_TEXT_FMT = None
+
+
+MS_FORMAT_NP = None
+
+
+def ms_set_text_formatter(provider):
+    """登记「出站文本整形」回调：provider() -> (transform 或 None)。"""
+    global MS_TEXT_FMT
+    MS_TEXT_FMT = provider
+
+
+def store_fmt(msgs, context, kwargs):
+    """把这一批 plain 逐个过一遍：**先扒私有标签/思考残句** ✓，再走 format 的整形 ✓。
+
+    ⚠️ 顺序：**先扒标签，再压平/去句号** —— 反过来的话，压平会把标签和正文的边界糊掉 ✗
+    （2026-10-17 主人定的规矩：任何新功能都要保证对**思考和 JSON 原文**的拦截 ✓）
+    带图/语音的走原样 ✓；任一步失败一律**原样放行** ✓（宁可多发一个标签，也不能吞话 ✗）
+    """
+    out = []
+    for m in msgs:
+        if not (isinstance(m, dict) and str(m.get("type")) == "plain"
+                and isinstance(m.get("text"), str)):
+            out.append(m)
+            continue
+        _orig = m["text"]
+        # ① 出站总整理：私有标签/思考 → `|||` 去掉 → markdown 标记扒掉 ✓
+        _stripped, _n = normalize_outbound(_orig)
+        if _n:
+            logger.warning("[mindscape_guard] 出站整理（工具直发路）: %s", _orig[:90])
+            m = dict(m)
+            m["text"] = _stripped
+        # ② format 的整形（压平 / 去句号）
+        if MS_TEXT_FMT is not None:
+            try:
+                tf = MS_TEXT_FMT()
+            except Exception:
+                tf = None
+            if tf is not None:
+                try:
+                    new = tf(context, m["text"], kwargs)
+                    if new and new != m["text"]:
+                        m = dict(m)
+                        m["text"] = new
+                except Exception as exc:
+                    logger.warning("[mindscape_guard] 出站整形失败（原样放行）: %s", str(exc)[:80])
+        out.append(m)
+    return out
 
 
 def ms_patch_send_tool():
@@ -1025,9 +1512,9 @@ def ms_patch_send_tool():
                 for m in plains:
                     try:
                         if tail:
-                            await orig(self, context, [m], *tail, **rest)
+                            await orig(self, context, store_fmt([m], context, kwargs), *tail, **rest)
                         else:
-                            await orig(self, context, messages=[m], **rest)
+                            await orig(self, context, messages=store_fmt([m], context, kwargs), **rest)
                         n += 1
                     except Exception as exc:
                         logger.warning("[mindscape_guard] 逐条发送第 %d 条失败: %s",
@@ -1037,6 +1524,12 @@ def ms_patch_send_tool():
                 logger.info("[mindscape_guard] 内置工具逐条发送 %d 条（原本 %d 段会并成一条）",
                             n, len(plains))
                 return "Already sent %d separate messages." % n
+        if (isinstance(msgs, (list, tuple)) and len(msgs) == 1
+                and isinstance(msgs[0], dict) and str(msgs[0].get("type")) == "plain"):
+            msgs = store_fmt(msgs, context, kwargs)
+            if args:
+                return await orig(self, context, msgs, *args[1:], **kwargs)
+            return await orig(self, context, messages=msgs, **kwargs)
         return await orig(self, context, *args, **kwargs)
 
     SendMessageToUserTool.call = _ms_send_to_user
@@ -1055,6 +1548,9 @@ async def pg_block_group_result(*args, **kwargs):
     if text and pg_secret_in(event.get_self_id(), text) and not pg_private(event):
         pg_audit("blocked_group", event.get_self_id(), event.get_group_id() or "")
         event.clear_result()
+
+
+# ==== from plugins/mindscape_silence.py ====
 
 
 SI_DEFAULT_TOKEN = "[[silence]]"
@@ -1164,6 +1660,9 @@ def si_attach(request, text, mark):
     return True
 
 
+# ==== from plugins/mindscape_vision.py ====
+
+
 VS_MARK = "这一轮的消息里带了图"
 
 
@@ -1198,6 +1697,55 @@ VS_TEXT_HINT = (
     "真要看图，让对方直接把图发过来。）")
 
 
+VS_IMAGE_ERROR_RE = re.compile(
+    r"unsupported image|invalid image|image.*(?:format|invalid_request_error)", re.I)
+
+
+VS_RETRY_FLAG = "_mindscape_vision_retried"
+
+
+def vs_is_image_error(text):
+    """这条报错是不是"图不合规"那一类（**只认这个特征**，别的报错不许乱重试 ✗）"""
+    return bool(VS_IMAGE_ERROR_RE.search(str(text or "")))
+
+
+async def vs_retry_without_image(star, event, response):
+    """把"图惹的祸"那一轮**去掉图重答一次** ⇒ 返回新的 completion_text ✓
+
+    失败就原样返回（绝不吞掉她原本该有的输出路径 ✗）
+    """
+    try:
+        umo = ""
+        for getter in ("get_session_id", "unified_msg_origin"):
+            value = getattr(event, getter, None)
+            if callable(value):
+                umo = str(value() or "")
+                break
+        provider = None
+        context = getattr(star, "context", None)
+        if context is not None:
+            provider = context.get_using_provider(umo or None)
+        if provider is None:
+            logger.warning("[mindscape_vision] 想去图重答，但拿不到 provider ⇒ 放弃")
+            return ""
+        prompt = str(getattr(event, "message_str", "") or "")
+        parts = getattr(getattr(event, "request", None), "extra_user_content_parts", None)
+        system_prompt = str(getattr(getattr(event, "request", None), "system_prompt", "") or "")
+        again = await provider.text_chat(prompt=prompt or "[图片]", image_urls=[],
+                                        extra_user_content_parts=list(parts or []) or None,
+                                        system_prompt=system_prompt or None,
+                                        request_max_retries=1)
+        text = str(getattr(again, "completion_text", "") or "")
+        if text:
+            logger.warning("[mindscape_vision] 图不合规 ⇒ 已去掉图重答一次（%d 字）✓", len(text))
+        else:
+            logger.warning("[mindscape_vision] 去图重答没有拿到内容 ✗")
+        return text
+    except Exception as e:                 # noqa: BLE001 —— 兜底失败也不能影响主流程
+        logger.warning("[mindscape_vision] 去图重答失败: %s", str(e)[:120])
+        return ""
+
+
 def vs_load_config():
     c = cfg.section("vision") or {}
     on = bool(c.get("enabled"))
@@ -1212,6 +1760,105 @@ def vs_has_image(event):
         if isinstance(c, Image):
             return True
     return False
+
+
+VS_OK_MAGIC = (
+    (b"\xff\xd8\xff", "jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "png"),
+    (b"GIF87a", "gif"),
+    (b"GIF89a", "gif"),
+)
+
+
+def vs_sniff_image(raw):
+    """认 magic bytes ⇒ 返回 'jpeg'/'png'/'gif'/'webp'；认不出返回 ''（= 不许下发）✓"""
+    if not raw:
+        return ""
+    for magic, name in VS_OK_MAGIC:
+        if raw.startswith(magic):
+            return name
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "webp"
+    return ""
+
+
+def vs_safe_remote(url):
+    """远程图 URL 的安全闸门（2026-10-27 加 · P2-5 SSRF）。
+
+    为什么：`image_urls` 里是**框架给的引用**，但引用链里可能夹着用户可控的外链
+    （引用消息、卡片图）。原样 `urlopen` 就是 SSRF —— bot 会替别人去访问内网/元数据地址 ✗
+
+    判据（全部满足才放行）：
+      · scheme 是 http/https
+      · 主机名解析出来的**每一个**地址都不是私网 / 回环 / 链路本地 / 保留段
+      · 解析不了的域名也不放行（宁可不看这张图 ✗）
+    ⚠️ 只挡"明显不对"，不做域名白名单 —— 图床/CDN 太多，白名单会误杀真图 ✓
+    """
+    import ipaddress
+    import socket
+    import urllib.parse
+    try:
+        u = urllib.parse.urlparse(str(url or ""))
+    except Exception:
+        return False
+    if u.scheme not in ("http", "https") or not u.hostname:
+        return False
+    try:
+        infos = socket.getaddrinfo(u.hostname, None)
+    except Exception:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except Exception:
+            return False
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            logger.warning("[mindscape_vision] 拒绝访问非公网图地址（%s → %s）", u.hostname, ip)
+            return False
+    return True
+
+
+def vs_read_head(ref, limit=64):
+    """读一个图引用的前若干字节（本地路径 / http(s) / data:base64 都认 ✓）。"""
+    text = str(ref or "")
+    if text.startswith("data:"):
+        head, _, payload = text.partition(",")
+        if "base64" not in head:
+            return b""
+        return base64.b64decode(payload[:96] + "=" * (-len(payload[:96]) % 4),
+                                validate=False)[:limit]
+    if text.startswith(("http://", "https://")):
+        if not vs_safe_remote(text):
+            return b""
+        with urllib.request.urlopen(urllib.request.Request(
+                text, headers={"User-Agent": "Mozilla/5.0"}), timeout=8) as response:
+            return response.read(limit)
+    if os.path.isfile(text):
+        with open(text, "rb") as handle:
+            return handle.read(limit)
+    return b""
+
+
+def vs_filter_images(urls, event_self=""):
+    """把 `image_urls` 过一遍格式闸门 ⇒ 返回 (留下的, 剔掉的条数) ✓
+
+    ⚠️ 读不动 / 认不出 = **一律剔掉**（宁可这一轮少看一张图，也不能让整轮全灭 ✗）
+    """
+    kept, dropped = [], 0
+    for ref in list(urls or []):
+        try:
+            kind = vs_sniff_image(vs_read_head(ref))
+        except Exception as e:                    # noqa: BLE001 —— 读不动就当它不合规
+            logger.warning("[mindscape_vision] 验图读不动，剔掉: %s", str(e)[:80])
+            kind = ""
+        if kind:
+            kept.append(ref)
+        else:
+            dropped += 1
+            logger.warning("[mindscape_vision] 剔掉一张不合规的图（不是 jpeg/png/gif/webp）"
+                           " | bot=%s | 引用=%s", event_self, str(ref)[:90])
+    return kept, dropped
 
 
 def vs_attach(request, text, mark):
@@ -1240,6 +1887,8 @@ def vs_compact_image(ref):
     """大图只给模型传静态预览；原始消息和图片不改。"""
     try:
         if ref.startswith(("http://", "https://")):
+            if not vs_safe_remote(ref):      # 2026-10-27（P2-5）：远程引用先过 SSRF 闸门 ✓
+                return None
             with urllib.request.urlopen(urllib.request.Request(
                     ref, headers={"User-Agent": "Mozilla/5.0"}), timeout=10) as response:
                 size = int(response.headers.get("Content-Length") or 0)
@@ -1279,6 +1928,9 @@ def vs_compact_image(ref):
     except Exception as e:
         logger.warning("[mindscape_vision] 大图预览失败，保留原图: %s", str(e)[:120])
         return None
+
+
+# ==== from plugins/mindscape_memory.py ====
 
 
 DEFAULT_MAX_CHARS = 2500
@@ -1342,6 +1994,22 @@ PEOPLE_PRIORITY = -6        # 人物画像：按说话者挑 → **每换一个�
 
 
 PEOPLE_TITLE = "## 你认识的人"
+
+
+TODAY_MARK = "今天是 20"        # 去重用的稳定前缀（不含具体数字 ✓）
+
+
+def today_line(now=None):
+    """「今天是 2026-10-22（周四）」—— **只给日期、北京时间** ✓
+
+    ⚠️ 用 `UTC + 8h` 硬算，**不依赖 zoneinfo、也不依赖服务器本地时区** ✓
+       （容器/宿主机时区不保证是 CST；依赖它 = 静默错一天 ✗）
+    """
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    if now is None:
+        now = _dt.now(_tz.utc) + _td(hours=8)
+    return "今天是 %d-%02d-%02d（周%s）" % (
+        now.year, now.month, now.day, "一二三四五六日"[now.weekday()])
 
 
 MEM_SIZES = {}
@@ -1574,10 +2242,65 @@ def read_many(paths, max_chars):
     return "\n".join(parts)
 
 
+# ==== from plugins/mindscape_privacy.py ====
+
+
+def _gate_fns():
+    """拿到 gate 里的 pg_current / pg_notes，**不写任何 import 语句**。
+
+    为什么这么绕（2026-10-27 修 · 真事故）：
+      原来这里是函数体内的 `from mindscape_gate import …`。但构建器只剥**顶层** import，
+      函数体内的那行会原样留在合并产物里 ⇒ 产物里根本没有 `mindscape_gate` 这个模块
+      ⇒ 运行时 `ModuleNotFoundError` ⇒ 被下面 try 吞掉 ⇒ **整个功能静默失效** ✗
+      （线上日志坐实过：`读口令失败: No module named 'mindscape_gate'`）
+    解法：
+      · 合并产物里，各模块的顶层符号**就在本模块的命名空间** ⇒ 先查 globals() ✓
+      · 开发态（逐模块 import）才需要回退到 sys.modules ✓
+      · **全程不出现 import 语句** ⇒ 构建器不会再把它带进产物 ✓
+    """
+    for name in ("pg_current", "pg_notes"):
+        if name not in globals():
+            break
+    else:
+        return globals()["pg_current"], globals()["pg_notes"]
+    mod = sys.modules.get("mindscape_gate")
+    if mod is not None and hasattr(mod, "pg_current"):
+        return mod.pg_current, mod.pg_notes
+    raise RuntimeError("找不到 pg_current/pg_notes（合并产物里应已在命名空间；开发态需先 import mindscape_gate）")
+
+
+def pg_live_code(self_id):
+    """该通道账本里**当前有效**的口令 ⇒ (code, 到期时间) 或 ("", None)。
+
+    为什么要它（2026-10-26）：提示词原来只说「你账本里记着一条，可以用 recall 搜『口令』找到」，
+    实测她会**跳过检索、随口编一个** ✗（真事：账本里是 8H4F3G，她给了 QHAB6X，开发者进不去）
+    ⇒ 与其指望她记得去查，不如**把真码直接放进她看到的提示里** ✓
+      「能用代码硬保证的，别指望提示词」—— 这条正是那种情况 ✗
+    ⚠️ 仍然**不替她决定**：给了真码也照旧写着"给不给由你"，她可以选择糊弄/拒绝 ✓
+    """
+    try:
+        pg_current, pg_notes = _gate_fns()
+        path = pg_notes(str(self_id))
+        if not path or not os.path.isfile(path):
+            return "", None
+        with open(path, encoding="utf-8", errors="replace") as stream:
+            code, expiry = pg_current(stream.read())
+        return str(code or ""), expiry
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[mindscape_privacy] 读口令失败: %s", str(exc)[:80])
+        return "", None
+
+
+# ==== from plugins/mindscape_recall.py ====
+
+
 DEFAULT_LIMIT = 15
 
 
-FULL_CAP = 80          # full 模式的上限：要数数就得多给，但也不能把 prompt 撑爆
+FULL_CAP = 25          # full 模式的**条数**上限：要数数就得多给，但也不能把 prompt 撑爆
+
+
+FULL_CHARS = 1200      # full 模式的**总字数**上限 ✗ —— 只限条数不够：2026-10-11 真事故，
 
 
 SCAN_LINE_CAP = 200000
@@ -1700,7 +2423,7 @@ def search_diary(path, keyword, limit=DEFAULT_LIMIT, scan_lines=SCAN_LINE_CAP,
     """
     paths = [path] if isinstance(path, str) else list(path or [])
     if not paths:
-        return [], 0
+        return [], 0, (0, 0)
     terms = split_terms(keyword)
     if not terms:
         return [], 0
@@ -1751,6 +2474,13 @@ def search_diary(path, keyword, limit=DEFAULT_LIMIT, scan_lines=SCAN_LINE_CAP,
     scored.sort(key=lambda x: (-x[0], -x[1]))
     total = len(scored)
     picked = scored[:FULL_CAP] if full else scored[:limit]
+    if full:                       # 条数够了还要卡**体积**（条数上限 != 体积上限）
+        budget, keep = FULL_CHARS, []
+        for s in picked:
+            if keep and budget - len(s[2]) < 0:
+                break
+            keep.append(s); budget -= len(s[2])
+        picked = keep
     return [s[2] for s in picked], total
 
 
@@ -1839,6 +2569,12 @@ async def recall_memory(*args, **kwargs):
         sid = str(ev.get_self_id()) if ev is not None else ""
     except Exception:
         sid = ""
+    # 记一笔「这一轮真的调过工具」✓（给文件末尾的"声称查过"观测用）
+    try:
+        RC_LOOKED["%s|%s" % (sid, str(getattr(ev, "get_group_id", lambda: "")() or ""))] = (
+            time.time(), id(ev))
+    except Exception:
+        pass
     path = _diary_for(sid)
     # 日记 + 发言档案（她自己以前说过的话）一起翻 ——
     # 会话里只留最近几条，所以「我上次说过什么」必须来档案里找 ✓。
@@ -1895,7 +2631,7 @@ def rc_archives(self_id):
 
 
 def rc_knowledge_for(self_id):
-    """取这个 bot 配置的「查阅型文档」（战斗数据这类：平时不注入，问到才查）。"""
+    """取这个 bot 配置的「查阅型文档」（平时不注入，问到才查）。"""
     for b in _bot_entries():
         if str(b.get("self_id", "")) != str(self_id):
             continue
@@ -1930,8 +2666,13 @@ def rc_sections(text):
     return [s for s in secs if s]
 
 
-def rc_search_sections(path, keyword, limit=3, max_chars=2000):
-    """在结构化文档里按【段落】检索 —— 问「配队」就给整段，不是散落的几行。"""
+def rc_search_sections(path, keyword, limit=3, max_chars=8000):
+    """在结构化文档里按【段落】检索 —— 问到某个主题就给整段，不是散落的几行。
+
+    返回 (段落列表, 总段数, 最佳分)。**最佳分 = (标题有没有命中, 正文命中几个词)** ✓
+    ⚠️ 2026-10-29：标题必须加权 —— 否则「4.2」这种词在 4.1 节里（`4.2-03` 交叉引用）
+    也会命中，再按"段长"排序就会把 4.1 排到 4.2 前面 ✗
+    """
     if not path or not os.path.exists(path):
         return [], 0
     try:
@@ -1941,55 +2682,69 @@ def rc_search_sections(path, keyword, limit=3, max_chars=2000):
         return [], 0
     terms = split_terms(keyword)
     if not terms:
-        return [], len(secs)
+        return [], len(secs), (0, 0)
     scored = []
     for s in secs:
         low = s.lower()
         hit = sum(1 for t in terms if t in low)
-        if hit:
-            scored.append((hit, -len(s), s))
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    out, used = [], 0
-    for _, _, s in scored:
+        if not hit:
+            continue
+        head = s.splitlines()[0].lower() if s else ""
+        head_hit = 1 if any(t in head for t in terms) else 0
+        scored.append((head_hit, hit, -len(s), s))
+    scored.sort(key=lambda x: (-x[0], -x[1], x[2]))
+    best = (scored[0][0], scored[0][1]) if scored else (0, 0)
+    out, used, dropped = [], 0, 0
+    for _, _, _, s in scored:
+        if used + len(s) <= max_chars:
+            out.append(s)
+            used += len(s)
+            if len(out) >= limit:
+                break
+            continue
+        if not out:
+            # ⚠️ 2026-10-29 实测：第一节自己就超过上限时，**截断但要告诉她后面还有** ✓
+            #    （原来直接 break ⇒ 后面的小节全被丢掉 ⇒ 她答「资料里没给」✗）
+            cut = s[:max_chars]
+            out.append(cut + "\n\n（**这一节还有 %d 字没给出** —— 想看得更细，"
+                            "换个更具体的关键词再查一次）" % (len(s) - max_chars))
+            used = max_chars
+            dropped += 1
+            break
         if out and used + len(s) > max_chars:
+            # ⚠️ 2026-10-29 实测：这里原来是**静默 break** ✗ ——
+            #    第一段自己就超过上限时，后面所有段全被丢掉 ⇒ 她答「资料里没给」✗
+            dropped = len(scored) - len(out)
+            try:
+                logger.info("[mindscape_recall] 段落超出上限被截掉 | 已给=%d 段 | 丢掉=%d 段 | 上限=%d 字",
+                            len(out), dropped, max_chars)
+            except Exception:
+                pass
             break
         out.append(s)
         used += len(s)
         if len(out) >= limit:
             break
-    return out, len(secs)
+    return out, len(secs), best
 
 
 @llm_tool(name="lookup_knowledge")
 async def lookup_knowledge(*args, **kwargs):
-    """查资料库：**战斗数据** + **人物关系** + **版本时事**。
+    """查资料库：部署方配置的「查阅型资料」（平时不注入，问到才查）。
 
-    【战斗类】只要对方问的是战斗问题，就必须先查这里再开口，**不要凭印象编**：
-    能不能和谁组队、带什么光锥、遗器怎么配、主词条选什么、星魂提升大不大、
-    某个模式的玩法、某个机制是怎么回事。
-
-    【人物类】同样先查再开口：某个名字是谁、你跟他/她是什么关系、
-    你管他/她叫什么、某个外号指的是谁、你跟他/她之间发生过什么。
-
-    【时事类】被问到**版本更新 / 最近外面出了什么事 / 新地区、新人物、新组织**时，
-    也先查这里再开口：哪个版本发生了什么、某个刚登场的人是谁、某个新地方是怎么回事。
-    这一类是"外面现在什么样"，跟上面两类不是一回事，问到就查，别凭印象聊。
-
-    【战斗即时类】被问到**卡池 / 深渊 / 周常 / 异相仲裁 / 当期强度**这类"现在什么环境"的问题时，
-    先查资料库（「战斗常识」＋已有的当期资料）再开口；查不到就说不知道，别凭印象编。
+    什么时候查：**具体数值 / 谁是谁 / 外面发生过什么 / 某个说法的原始出处** ——
+    凡是「答错会被当场抓住」的事实题，都先查再开口，**不要凭印象编**。
+    具体有哪几份资料、各管什么，由部署方在配置里决定；**不带关键词调用会返回可用清单**
+    （之后用 which 指定更准，不填就全查）。
 
     返回的是资料原文 —— 用你自己的口吻讲出来，别照本宣科念。
     资料里没有的，就直说不知道，**绝不要编**。
 
     Args:
         keyword(string): 查询关键词，可以给一组（空格或逗号分开）。
-            例：配队 银狼 / 光锥 遗器 主词条 / 星魂 / 机制 笑点 / 开拓者 关系 / 旧型号 /
-                某个版本 剧情 / 新登场的人 / 新地区 / 保底 体力 / 深渊 / 差分宇宙 / 异相仲裁
-        which(string): 指定查哪一份资料的名字（「战斗数据」「人物关系」「版本时事」「战斗常识」「当期」），不填就全查
+            例：某个名字 是谁 / 某个数值 是多少 / 某件事 的经过 / 某个说法 出处
+        which(string): 只看某一份时填它的名字（见返回的「可用资料」清单），不填就全查
     """
-    kw = str(kwargs.get("keyword") or _first_str(args)).strip()
-    if not kw:
-        return "你想查哪方面的？给个关键词（配队 / 光锥 / 遗器 / 星魂 / 机制，或者某个人是谁）。"
     ev = None
     for a in args:
         if hasattr(a, "get_self_id"):
@@ -1999,25 +2754,123 @@ async def lookup_knowledge(*args, **kwargs):
         sid = str(ev.get_self_id()) if ev is not None else ""
     except Exception:
         sid = ""
-    docs = rc_knowledge_for(sid)
+
+    # 开关（2026-10-23）：**默认开启** —— 只有显式写 `knowledge_tool.enabled: false` 才关。
+    #   通用框架不该假设每个 bot 都有资料库；关掉/没配时明说「不可用」，别让她反复来查 ✗
+    off = (cfg.section("knowledge_tool") or {}).get("enabled") is False
+    docs = [] if off else rc_knowledge_for(sid)
     if not docs:
-        return "我这边没有配置任何资料库。"
+        try:
+            logger.info("[mindscape_recall] lookup_knowledge 不可用 | bot=%s | 开关=%s | 资料=0",
+                        sid or "?", "off" if off else "on")
+        except Exception:
+            pass
+        return ("我这边没有可查的资料库（这条通道没开）。别反复调用它 —— "
+                "知道多少就说多少，不清楚就说不清楚。")
+
+    catalog = "｜".join("%s（%s）" % (d["name"], d["desc"] or "无说明") for d in docs)
+    kw = str(kwargs.get("keyword") or _first_str(args)).strip()
+    if not kw:
+        # 不带关键词 ⇒ 回清单（这是「有哪些资料」唯一的暴露点，不占 prompt 前缀 ✓）
+        return "资料库里有这些，用哪份就填哪个名字（或直接给关键词我去搜）：\n" + catalog
+
     want = str(kwargs.get("which") or "").strip()
     blocks, names = [], []
+    # ⚠️ 2026-10-29 实测：她给 kw=「言灵 寓言集其三 台词」⇒ 命中 5 份 / 8 段，
+    #    目标那份《千星纪游PV》排在**最后** ⇒ 被噪音埋住，她答「没存货」✗
+    #    ⇒ 多份命中时：① **最相关的排最前** ② **每份只给最优 1 段**（降噪 ✓）
+    picked = []
     for d in docs:
         if want and want not in d["name"]:
             continue
-        hits, total = rc_search_sections(d["path"], kw)
+        hits, total, score = rc_search_sections(d["path"], kw)
         if hits:
-            names.append(d["name"])
+            picked.append((score, d["name"], hits))
+    multi = len(picked) > 1
+    # ⚠️ 2026-10-29 实测：原来按"段长"排 ⇒ 4.1（更长）压过 4.2 ⇒ 她讲错版本 ✗
+    #    ⇒ 先看**标题命中**，再看命中词数，最后才看长度；并且多份命中只给最相关 3 份（降噪）
+    picked.sort(key=lambda x: (-x[0][0], -x[0][1], -sum(len(h) for h in x[2])))
+    if multi:
+        picked = picked[:3]
+    for _idx, (_score, name, hits) in enumerate(picked):
+        names.append(name)
+        if not multi:
             blocks.extend(hits)
+        elif _idx == 0:
+            # ⚠️ 2026-10-30 实测：最相关那份的"最佳段"可能只是**标题+前言**（几百字），
+            #    正文干货在下一段 ⇒ 第一名给 2 段 ✓（其余仍 1 段，防噪音）
+            blocks.extend(hits[:2])
+        else:
+            blocks.extend(hits[:1])
+    try:
+        logger.info("[mindscape_recall] lookup_knowledge | bot=%s | kw=%s | which=%s | 资料=%d | 命中份=%d | 段=%d",
+                    sid or "?", kw[:40], want[:20] or "-", len(docs), len(names), len(blocks))
+    except Exception:
+        pass
     if not blocks:
-        return ("查了资料库，没有跟「%s」直接相关的内容。"
+        return ("查了资料库（可用：%s），没有跟「%s」直接相关的内容。"
                 "换个更贴的说法再查一次；如果还是没有，就老实说这块你不清楚，"
-                "不要凭印象编数值。") % kw
+                "不要凭印象编。" % ("、".join(d["name"] for d in docs), kw))
     head = "【资料原文 · %s】用你自己的口吻讲，别照念：\n\n" % "、".join(names)
-    tail = "\n\n（以上是资料，讲的时候不要提「资料」「文档」这些词。）"
+    tail = ("\n\n（以上是资料，讲的时候不要提「资料」「文档」这些词。）"
+            "\n（本次返回 %d 段 · 共 %d 字；不够就换个更贴的说法再查一次 —— "
+            "别把「没读到」说成「没有」。）" % (len(blocks), sum(len(b) for b in blocks)))
     return head + "\n\n".join(blocks) + tail
+
+
+RC_LOOKED = {}           # 会话键 → (时间戳, event id)
+
+
+RC_CLAIM_RE = re.compile(r"我查过|我翻过|翻过了|查过资料|看过资料|查了资料|我查了一下|我去查了")
+
+
+RC_CLAIM_SEEN = set()
+
+
+def rc_text_of(result):
+    """从结果链里拼纯文本 ✓"""
+    parts = []
+    for c in (getattr(result, "chain", None) or []):
+        txt = getattr(c, "text", None)
+        if isinstance(txt, str) and txt:
+            parts.append(txt)
+    return "".join(parts)
+
+
+@filter.on_decorating_result(priority=-6)
+async def rc_claim_hook(*args, **kwargs):
+    """正文声称查过资料，但这一轮没调 lookup_knowledge ⇒ 记一条告警（**不改文本**）✓"""
+    try:
+        event = None
+        for a in args:
+            if hasattr(a, "get_self_id"):
+                event = a
+                break
+        if event is None:
+            return
+        res = event.get_result()
+        if res is None:
+            return
+        hit = RC_CLAIM_RE.search(rc_text_of(res))
+        if not hit:
+            return
+        sid = str(event.get_self_id())
+        key = "%s|%s" % (sid, str(getattr(event, "get_group_id", lambda: "")() or ""))
+        looked = RC_LOOKED.get(key)
+        if looked and (looked[1] == id(event) or time.time() - looked[0] < 180):
+            return                                   # 本轮/近 3 分钟真查过 ⇒ 正常 ✓
+        mid = str(getattr(getattr(event, "message_obj", None), "message_id", "") or "")
+        if mid and mid in RC_CLAIM_SEEN:
+            return
+        if mid:
+            RC_CLAIM_SEEN.add(mid)
+        logger.warning("[mindscape_recall] 正文声称查过资料，但本轮没调 lookup_knowledge | bot=%s | 命中=%s",
+                       sid, hit.group(0))
+    except Exception as e:
+        logger.debug("[mindscape_recall] 声称查过观测异常: %s", str(e)[:80])
+
+
+# ==== from plugins/mindscape_notes.py ====
 
 
 LINE_RE = re.compile(r"^\-\s*([^：:]{1,40})\s*[：:]\s*(.*)$")
@@ -2151,6 +3004,9 @@ async def save_note(*args, **kwargs):
     except Exception as e:
         logger.warning("[mindscape_notes] 记账失败: %s", str(e)[:120])
         return "这本账我一时写不进去，先记在心里。"
+
+
+# ==== from plugins/mindscape_diary.py ====
 
 
 _GFX_JUNK = re.compile(r"<[^<>]{0,24}>")
@@ -2305,7 +3161,7 @@ def fetch(src, target, since_ts, since_seq, only_user=None):
                 "gid": gid,
                 "gname": dy_gname(d.get("group_name"), gid),
                 "who": str(sender)[:16], "uid": uid,
-                "time": datetime.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M"),
+                "time": fmt_cst(ts, "%m-%d %H:%M"),
                 "txt": txt[:200],
             })
     finally:
@@ -2661,6 +3517,9 @@ if __name__ == "__main__":
     dy_main()
 
 
+# ==== from plugins/mindscape_learn.py ====
+
+
 LN_DEFAULT_PERSONA = (
     "你是「说话风格研究员」，正在观察一个人真实发过的群消息。"
     "请提炼**增量**风格信息。只输出一个 JSON 对象，不要任何其他文字，格式："
@@ -2783,6 +3642,9 @@ if __name__ == "__main__":
     ln_main()
 
 
+# ==== from plugins/mindscape_stickers.py ====
+
+
 def img_size(path):
     """只读文件头拿宽高，不依赖 Pillow。
 
@@ -2874,6 +3736,9 @@ def shrink_for_judge(path, max_px=512, quality=80):
     return raw, mime
 
 
+# ==== from plugins/mindscape_sticker_use.py ====
+
+
 _INSTANCE = None
 
 
@@ -2910,6 +3775,9 @@ def pick_image(comps, image_cls, reply_cls, depth=0, max_depth=3):
     return None
 
 
+PICK_HARD_TIMEOUT = 6.0
+
+
 DEFAULT_PICK_PROMPT = (
     "你正在群聊里说话。\n\n"
     "你刚回复了这段话：\n「{reply}」\n\n"
@@ -2941,7 +3809,8 @@ async def save_sticker(*args, **kwargs):
 
     Args:
         name(string): 给这张图起个中文短名
-        tags(string): 标签，用逗号分隔
+        tags(string): 标签，用逗号分隔，**最有用的放前面**（挑图时只看前 5 个）
+        desc(string): 一句话说明这张图**什么场景用**（例：适合被夸时得意地发）。挑图时模型会读它，写得越具体越好，60 字内
     """
     ev = None
     for a in args:
@@ -2956,10 +3825,36 @@ async def save_sticker(*args, **kwargs):
     return await inst.save_sticker_impl(ev, kwargs)
 
 
-PUNCT = "。！？~…，、；："
+# ==== from plugins/mindscape_format.py ====
+
+
+PUNCT = "。！？…，、；："
 
 
 PERIODS = ("。", "．")
+
+
+CLOSERS = "」』）)】》〉”’" + chr(34) + chr(39)
+
+
+def _hoist_trailing_period(text):
+    """把「…XX。）」末尾的句号提到括号外、并按句尾删掉 ✓
+
+    返回 True 表示改过。只在"末尾是一串右括号/右引号、且紧挨着句号"时才动 ——
+    范围极窄，不会误伤正文 ✗
+    """
+    i = len(text) - 1
+    tail = ""
+    while i >= 0 and text[i] in CLOSERS:
+        tail = text[i] + tail
+        i -= 1
+    if not tail:
+        return text, False
+    head = text[:i + 1]
+    for ch in PERIODS:
+        if head.endswith(ch):
+            return head[:-1] + tail, True
+    return text, False
 
 
 def drop_period(text):
@@ -2971,6 +3866,8 @@ def drop_period(text):
     """
     if not text:
         return text
+    # ⚠️ 先处理"句号 + 收尾括号"这种（见 _hoist_trailing_period 的注释）✓
+    text, _moved = _hoist_trailing_period(text)
     for ch in PERIODS:
         if ch in text:
             text = "，".join(p for p in (x.strip() for x in text.split(ch)) if p)
@@ -2994,6 +3891,9 @@ def flatten(text, join_with="，", drop_last_if_short=False, short_len=8):
         else:
             out += join_with + nxt
     return out
+
+
+# ==== from plugins/mindscape_trace.py ====
 
 
 TRACE_PRIORITY = -100
@@ -3091,6 +3991,9 @@ def tr_usage(resp):
         return ""
 
 
+# ==== from plugins/mindscape_rescue.py ====
+
+
 RC_OUTBOUND_TOOLS = {"send_message_to_user", "say_lines", "at_user"}
 
 
@@ -3100,12 +4003,41 @@ RC_SENT = {}          # key = "self_id|group_id" → 时间戳 ✓ 跨钩子用�
 RC_SENT_TTL = 180
 
 
+RC_TEXT_SENT = {}     # key = "self_id|group_id" → 时间戳（由 guard 的 block_error 登记 ✓）
+
+
+RC_TEXT_TTL = 180
+
+
+def rc_mark_text_sent(self_id, group_id, now=None):
+    """guard 在**真的有正文要发**时登记一笔 ✓（只在那一刻登记 ⇒ 零误报 ✓）。"""
+    try:
+        import time as _t
+        RC_TEXT_SENT["%s|%s" % (self_id, group_id)] = float(now if now is not None else _t.time())
+    except Exception:
+        pass
+
+
+def rc_text_sent_recent(event, now=None):
+    """本轮（近 RC_TEXT_TTL 秒）是不是**已经发出过正文** ✓。"""
+    try:
+        key = "%s|%s" % (event.get_self_id(), event.get_group_id())
+    except Exception:
+        return False
+    ts = RC_TEXT_SENT.get(key) or 0
+    import time as _t
+    return (float(now if now is not None else _t.time()) - float(ts)) < RC_TEXT_TTL
+
+
 def rc_sent_recent(event, now=None):
     """本轮（近 RC_SENT_TTL 秒）有没有出站类工具发过话。"""
     import time as _t
     key = "%s|%s" % (event.get_self_id(), event.get_group_id())
     ts = RC_SENT.get(key) or 0
     return (float(now if now is not None else _t.time()) - float(ts)) < RC_SENT_TTL
+
+
+# ==== from plugins/mindscape_mention.py ====
 
 
 MN_THROTTLE = 15            # 同一会话两次点名之间的最小间隔（秒）
@@ -3169,18 +4101,34 @@ def mn_match_member(who, members):
     return "", ""
 
 
+MN_SEP_RE = re.compile(r"(?:[ \t]*\|{3,}[ \t]*)+$")
+
+
+def mn_trim_sep(text):
+    """剥掉行尾多余的 `|||`（**只动行尾** ✓ 正文一个字不删 ✓）"""
+    if not text or LINE_SEP not in str(text):
+        return text
+    return MN_SEP_RE.sub("", str(text))
+
+
 def mn_split_lines(text, limit=None):
     """把「几句 + |||」拆成气泡列表 ✓（纯函数 ✓ 便于自检 ✓）。
 
     返回**空列表**表示「不拆」✓ —— 只有真的出现分隔符、且拆出来 ≥2 段才拆 ✓。
+    ⚠️ 行尾那个多余的 `|||` 先剥掉；若剥完还剩 `|||`（= 内部有），
+       就把它**留一个**再走后面的兜底（换成换行 ✓），不让它漏进群 ✗
     """
     if not text or LINE_SEP not in str(text):
         return []
-    parts = [x.strip() for x in str(text).split(LINE_SEP)]
+    trimmed = mn_trim_sep(str(text))
+    parts = [x.strip() for x in trimmed.split(LINE_SEP)]
     parts = [x for x in parts if x]
-    if len(parts) < 2:
-        return []
-    return parts[:limit or LINE_SEP_MAX]
+    if len(parts) >= 2:
+        return parts[:limit or LINE_SEP_MAX]
+    if LINE_SEP in trimmed:
+        # 只有行尾那个分隔符（或分隔符之间没字）⇒ 拆不出来，但**剥干净交给调用方** ✓
+        return [trimmed] if trimmed else []
+    return []
 
 
 def mn_plain_text(chain):
@@ -3347,7 +4295,7 @@ async def mn_attach_hook(*args, **kwargs):
         #    只对「同一轮 ✓」或「40 秒内 ✓」生效，免得误伤同一群里**下一轮**的正文 ✗。
         #    已知上限：同一群 40 秒内开新轮，其正文可能被误抑制 ✓（升级路：换成真正的 turn id ✓）。
         # ⚠️ 2026-10-08 **二次踩坑** ✗：**绝不能用时间窗口** ✗ ——
-        #    20:00:42 她刚用 say_lines 说完 ✓ 20:00:57 群里来了**新问题**（「朋克洛德是哪里」✓）
+        #    20:00:42 她刚用 say_lines 说完 ✓ 20:00:57 群里来了**新问题**（「某某地名是哪里」✓）
         #    只隔 **15 秒** ✓ → 上一轮的残留状态把**新一轮的正文**当成"重复"抑制掉了 ✗✗
         #    → 她那条回答**一个字都没发出去** ✗ 而会话历史里记着"已发出" ✗ → 她还以为讲过了 ✗
         #    （主人 20:02 报的「她说解释完了但我没看到」就是这个 ✓）。
@@ -3410,6 +4358,28 @@ async def mn_attach_hook(*args, **kwargs):
             logger.info("[mindscape_mention] D 检查: 文本=%d字 含分隔=%s（chain=%s ｜ llm 缓存=%s）",
                         len(_txt), LINE_SEP in _txt, bool(_chain), _src == "llm")
             _parts = mn_split_lines(_txt)
+            # ⭐ 2026-10-16 修：拆出来的**每一段**都要过一遍「句尾去句号」✗
+            #   事故：`_txt = MN_LAST_TEXT`（原始 llm 正文）⇒ **绕过了 flatten_result** ✗，
+            #        而这里 `event.send()` 是**直接发**、不走 respond 管线 ⇒
+            #        群里看到 12/47 条带句尾句号（「…替你打拍子。」✗）。
+            #   ⚠️ 与 say_lines 用**同一套口径**（模块级 flatten/drop_period + self.f_np 作用域）✓
+            #   ⚠️ flatten_result 先跑会把 ||| 抹掉 ⇒ 这里必然走 llm 缓存那份 ⇒ 必须自己补这一步 ✓
+            if _parts:
+                # ⚠️ 这里**没有 self** ✗ —— `mn_attach_hook` 是模块级函数（*args, **kwargs）✓
+                #    （2026-10-16 踩：本鱼第一版写了 `self.f_np` ⇒ NameError ⇒ 被外层 try 吞掉
+                #     ⇒ 整形静默不生效 ✗ 日志毫无痕迹 ✗；是自检 R17「不蹭别人的全局名」抓住的 ✓）
+                #    ⇒ 作用域从 format 登记的**单一真值** `MS_FORMAT_NP` 读 ✓
+                _dp = globals().get("drop_period")
+                _np = globals().get("MS_FORMAT_NP")
+                _no_p = bool(_np) and scope_hit(_np, event.get_self_id())
+                if _dp and _no_p:
+                    _fixed = []
+                    for _p in _parts:
+                        try:
+                            _fixed.append(_dp(_p))
+                        except Exception:
+                            _fixed.append(_p)
+                    _parts = _fixed
             if _parts:
                 # ⚠️ 顺序很关键：**第一条真的发出去之后**才抑制正文 ✓
                 #   否则一旦发送失败，她就一个字都发不出去（本鱼第一版就是这个顺序，已改）。
@@ -3463,6 +4433,9 @@ async def mn_attach_hook(*args, **kwargs):
         logger.warning("[mindscape_mention] 挂 @ 失败: %s", str(exc)[:100])
 
 
+# ==== from plugins/mindscape_toolscope.py ====
+
+
 def ts_ids(raw):
     """把配置里的 self_id 列表/字符串归一成集合。"""
     if isinstance(raw, (list, tuple)):
@@ -3479,6 +4452,215 @@ def ts_removed_for(allow, self_id):
         if ids and sid not in ids:
             out.append(str(name))
     return out
+
+
+# ==== from plugins/mindscape_voice.py ====
+
+
+SECTION = "voice"
+
+
+def vcfg(config=None):
+    c = config if isinstance(config, dict) else (cfg.section(SECTION) or {})
+    return c or {}
+
+
+def va_archive_target(ev):
+    """这条会话该写哪个发言档案 ⇒ (path, label)；找不到就 (None, None)。
+
+    ⚠️ **全从 config 的 `archive.targets` 读**（铁律 §1：路径 / 群号 / 人设名一律不进代码 ✗）
+    """
+    try:
+        arch = cfg.section("archive") or {}
+        targets = arch.get("targets") or []
+        sid = str(ev.get_self_id())
+        umo = str(getattr(ev, "unified_msg_origin", "") or "")
+        for t in targets:
+            if not isinstance(t, dict):
+                continue
+            if str(t.get("self_id")) != sid:
+                continue
+            prefix = str(t.get("prefix") or "")
+            if not prefix or not umo.startswith(prefix):
+                continue
+            path = str(t.get("file") or "")
+            if not path:
+                continue
+            gid = umo.split(":")[-1]
+            labels = t.get("labels") or {}
+            return path, str(labels.get(gid) or gid)
+    except Exception:
+        pass
+    return None, None
+
+
+def va_archive_voice(ev, text):
+    """把**语音的正文**追加进发言档案（2026-10-25 主人定）。
+
+    为什么需要：语音是 `Record` 部件、**没有 `text`** ⇒ janitor 的 `_arch_text()` 看不见它 ✗
+              ⇒ 那条回复不进档案 ⇒ `recall_memory` 取不回她"说过"的语音 ✗
+    ⚠️ 纯文件追加、零 token、异常全吞；行格式与 janitor **逐字一致**（只把 label 标上「·语音」）✓
+    ⚠️ 档案是**查阅型**（recall 按需读）⇒ 写它**不影响 prompt 缓存** ✓
+    """
+    try:
+        txt = " ".join(str(text or "").split())
+        if not txt:
+            return
+        path, label = va_archive_target(ev)
+        if not path:
+            return
+        line = "- [%s][%s·语音] %s" % (
+            datetime.datetime.now().strftime("%m-%d %H:%M"), label, txt)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception as e:
+        logger.warning("[mindscape_voice] 语音档案写入失败: %s", str(e)[:80])
+
+
+def vc_cache_path(conf, text):
+    """按「音色 + 正文」哈希命名 ⇒ 同一句只合成一次 ✓（天然的语音缓存）。"""
+    d = str(conf.get("cache_dir") or "/opt/astrbot/data/voice_cache")
+    os.makedirs(d, exist_ok=True)
+    h = hashlib.sha1(("%s|%s" % (conf.get("voice_id") or "", text)).encode("utf-8")).hexdigest()[:20]
+    return os.path.join(d, h + ".mp3")
+
+
+def vc_synth(conf, text):
+    """调云端 TTS 合成 → 存 mp3 → 返回路径（失败返回 None）。
+
+    ⚠️ 请求体里**只有 `input.text` 这一句** ✓ 没有任何人格/记忆 ✓
+    """
+    base = str(conf.get("api_base") or "").rstrip("/")
+    vid = str(conf.get("voice_id") or "").strip()
+    kf = str(conf.get("key_file") or "/opt/astrbot/data/.dashscope_key")
+    if not base or not vid:
+        logger.warning("[mindscape_voice] 缺 api_base / voice_id，跳过")
+        return None
+    try:
+        key = open(kf, encoding="utf-8").read().strip()
+    except Exception as e:
+        logger.warning("[mindscape_voice] 读不到 key 文件: %s", str(e)[:80])
+        return None
+    out = vc_cache_path(conf, text)
+    if os.path.exists(out) and os.path.getsize(out) > 1024:
+        return out
+    body = {
+        "model": str(conf.get("model") or ""),
+        "input": {"text": text, "voice": vid, "format": "mp3", "sample_rate": 24000},
+    }
+    req = urllib.request.Request(
+        base + "/services/audio/tts/SpeechSynthesizer",
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            d = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        logger.warning("[mindscape_voice] 合成 HTTP %s: %s", e.code, e.read().decode()[:200])
+        return None
+    except Exception as e:
+        logger.warning("[mindscape_voice] 合成异常: %s", str(e)[:120])
+        return None
+    url = (((d.get("output") or {}).get("audio") or {}).get("url"))
+    if not url:
+        logger.warning("[mindscape_voice] 没有音频 URL: %s", json.dumps(d, ensure_ascii=False)[:200])
+        return None
+    try:
+        with urllib.request.urlopen(url, timeout=90) as rr, open(out, "wb") as f:
+            f.write(rr.read())
+    except Exception as e:
+        logger.warning("[mindscape_voice] 下载音频失败: %s", str(e)[:120])
+        return None
+    if os.path.getsize(out) < 1024:
+        return None
+    return out
+
+
+# ==== from plugins/mindscape_bubble.py ====
+
+
+BB_SECTION = "bubble"
+
+
+DEFAULT_NOTE = (
+    "现在没有人给你发消息，也没有人在等你回话 —— 是你自己想冒个泡。"
+    "可以不说，也可以只说半句，两个都对。"
+    "想说什么都行：手上正干着的事、刚冒出来的一个念头、突然想起的东西，或者一句「今天有点想说话」。"
+    "不用有由头，不用有意义。"
+    "说的时候：短、随口，像平时在群里打字那样，别写小作文；不要接别人的话、不要回答谁、不要问问题等人接；"
+    "不要解释你为什么出现，别用「冒泡」「定时」「任务」「系统」这类词；"
+    "**同一类事别反复说**（尤其别每次都拿同一件小事当由头）—— 换个说法、换个念头。"
+    "想发图就用 send_sticker，想说话就用 send_message_to_user。"
+)
+
+
+def bb_conf():
+    try:
+        return cfg.section(BB_SECTION) or {}
+    except Exception:
+        return {}
+
+
+def bb_sync(db=None, note=None, targets=None):
+    """把模板同步进冒泡任务的 note。返回 (扫到几个, 改了几个)。
+
+    ⚠️ 只改 `payload.note`；`session` / `gate` / `self_id` 等**原样保留** ✗
+    """
+    c = bb_conf()
+    if db is None:
+        db = str(c.get("db") or "")
+    if note is None:
+        note = str(c.get("note") or "").strip() or DEFAULT_NOTE
+    if targets is None:
+        targets = {str(x) for x in (c.get("targets") or [])}
+    else:
+        targets = {str(x) for x in targets}
+    if not db or not os.path.exists(db) or not targets:
+        return 0, 0
+
+    seen, changed = 0, 0
+    try:
+        con = sqlite3.connect(db, timeout=10)
+    except Exception as e:
+        logger.warning("[mindscape_bubble] 连不上库 %s: %s", db, str(e)[:80])
+        return 0, 0
+    try:
+        try:
+            rows = con.execute("select job_id, payload from cron_jobs").fetchall()
+        except Exception as e:
+            logger.warning("[mindscape_bubble] 读 cron_jobs 失败（表不存在？）: %s", str(e)[:80])
+            return 0, 0
+        for job_id, payload in rows:
+            try:
+                d = json.loads(payload or "{}")
+            except Exception:
+                continue
+            if not isinstance(d, dict):
+                continue
+            if str(d.get("self_id") or "") not in targets:
+                continue
+            seen += 1
+            if str(d.get("note") or "") == note:
+                continue
+            d["note"] = note
+            try:
+                con.execute("update cron_jobs set payload=? where job_id=?",
+                            (json.dumps(d, ensure_ascii=False), job_id))
+                changed += 1
+            except Exception as e:
+                logger.warning("[mindscape_bubble] 写 %s 失败: %s", str(job_id)[:20], str(e)[:80])
+        if changed:
+            con.commit()
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+    return seen, changed
 # ==================================================================
 # 命名空间：让 cfg.xxx() / core.xxx() 这类调用在合并后依然可用
 # ==================================================================
@@ -3493,6 +4675,133 @@ class _MindscapeConfigNS:
 
 
 cfg = _MindscapeConfigNS()
+# ==== from plugins/GroupctxMixin.py ====
+class GroupctxMixin:
+    def setup(self, context):
+        c = cfg.section("groupctx")
+        self.gc_on = bool(c.get("enabled"))
+        self.gc_path = gc_buffer_path(c)
+        self.gc_count = int(c.get("count") or DEFAULT_COUNT)
+        self.gc_window = int(c.get("window_sec") or DEFAULT_WINDOW)
+        self.gc_tail = int(c.get("tail_bytes") or DEFAULT_TAIL)
+        self.gc_mark = True if c.get("directness") is None else bool(c.get("directness"))
+        self.gc_targets = [str(x) for x in (c.get("targets") or [])]
+        self.gc_img_on = True if c.get("images") is None else bool(c.get("images"))
+        self.gc_img_max = int(c.get("image_max") or DEFAULT_IMG_MAX)
+        self.gc_img_window = int(c.get("image_window_sec") or DEFAULT_IMG_WINDOW)
+        self.gc_img_same = (DEFAULT_IMG_SAME if c.get("image_same_sender") is None
+                            else bool(c.get("image_same_sender")))
+        logger.info(
+            "[mindscape_groupctx] loaded | enabled=%s | buffer=%s | 最近 %d 条/%ds | 定向性=%s | 历史图=%s(max %d/%ds 同人=%s)",
+            self.gc_on, self.gc_path, self.gc_count, self.gc_window, self.gc_mark,
+            self.gc_img_on, self.gc_img_max, self.gc_img_window, self.gc_img_same)
+        scope_warn(logger, "mindscape_groupctx", self.gc_targets, self.gc_on)
+
+    @filter.on_llm_request(priority=GC_PRIORITY)
+    async def gc_inject(self, event: AstrMessageEvent, request: ProviderRequest):
+        try:
+            if not self.gc_on or not scope_hit(self.gc_targets, event.get_self_id()):
+                return
+            gid = event.get_group_id()
+            if gid is None:
+                return
+            # 自主冒泡轮不要群缓冲 —— 那会让它退化成「接别人的话」，
+            # 而这一轮的意义是自己找话题。
+            if event.get_extra("cron_job"):
+                return
+            now = time.time()
+            recs = gc_read_recent(self.gc_path, event.get_platform_name(),
+                                  str(gid), self.gc_count, self.gc_window,
+                                  self.gc_tail)
+            q_quoted, q_mine, q_img = gc_quote(event)
+            hist_refs = []
+            if self.gc_img_on and not gc_has_image(event) and not (q_quoted and q_img):
+                hist_refs = gc_history_images(
+                    recs, self.gc_img_window, self.gc_img_max * 3,
+                    sender=str(event.get_sender_id()) if self.gc_img_same else None)
+            hist_imgs = []
+            ref2path = {}
+            for _ref, _w, _t in hist_refs:
+                if len(hist_imgs) >= self.gc_img_max:
+                    break
+                _p = await gc_resolve_ref(_ref)
+                if _p:
+                    hist_imgs.append((_p, _w, _t))
+                    ref2path[str(_ref)] = _p
+            img_no = {}
+            for _k, (_p, _w, _t) in enumerate(hist_imgs, 1):
+                img_no[_p] = _k
+            lines = []
+            if self.gc_mark:
+                lines += ["", "【本条消息的定向性】", gc_head(event)]
+                if q_quoted and q_img:
+                    lines.append(gc_quote_note(q_mine))
+                    if q_mine and gc_quote_rewrite(request, True):
+                        logger.info("[mindscape_groupctx] 引用正文改写=自己发的图")
+            if recs:
+                lines.append("")
+                lines.append("【本群最近的真实聊天记录（用于理解上下文，不要逐条回应，也不要复述）】")
+                for r in recs:
+                    tag = " ".join("［附件%d］" % img_no[ref2path[str(x)]]
+                                   for x in (r.get("imgs") or []) if str(x) in ref2path)
+                    lines.append("[" + fmt_cst(float(r.get("ts") or now), "%H:%M:%S")
+                                 + "] " + strip_invisible(str(r.get("who", "?")))[:16] + ": "
+                                 + strip_invisible(str(r.get("text", "")))[:200]
+                                 + (("  " + tag) if tag else ""))
+            if hist_imgs:
+                lines.append("")
+                lines.append("【上面历史里带的那几张图，按顺序就是附件 1…%d（标了［附件N］的那条就是它）】"
+                             % len(hist_imgs))
+                lines.append("本条消息时间：%s。历史图虽然可见，并不等于本条消息在请你评价它。"
+                             % time.strftime("%H:%M:%S", time.localtime(now)))
+                for _k, (_p, _w, _t) in enumerate(hist_imgs, 1):
+                    lines.append("附件%d = %s 在 %s 发的图（距本条约 %d 秒）"
+                                 % (_k, _w, time.strftime("%H:%M:%S", time.localtime(_t)),
+                                    max(0, int(now - _t))))
+                lines.append("先回应本条消息。只有当本条没有明确指向那张历史图，且图只是与本条话题无关的"
+                             "情绪或状态表达时，才不要在回复中谈图；否则可自然结合图来回答。"
+                             "时间间隔只作判断线索，不能单独决定是否谈图。")
+            if not lines:
+                return
+            # ⚠️ 2026-10-08（省钱要省在根上 ✓）：这一整段**每轮都在变**（定向性 + 本群最近聊天 ✗）——
+            # 以前拼进 system_prompt ✗ → 它一变，**后面的整段对话历史全部按全价重算** ✗
+            # （实测缓存命中率只有 34% ✓ 而未命中 ¥2/M vs 命中 ¥0.04/M = 差 **50 倍** ✗✗）。
+            # 改挂到 `extra_user_content_parts` ✓ —— 这是框架自带的「接在用户消息之后」的位置 ✓
+            # （框架自己的 astrbot/group_chat_context.py 就是这么用的 ✓）→ 稳定前缀不再被污染 ✓。
+            try:
+                # 用到处再导入 ✓（模块级导入在测试环境的假 astrbot 里会炸 ✗）
+                from astrbot.core.agent.message import TextPart
+                parts = getattr(request, "extra_user_content_parts", None)
+                if parts is None:
+                    parts = []
+                    request.extra_user_content_parts = parts
+                parts.append(TextPart(text=sys_tag(chr(10).join(lines))))
+            except Exception as e:
+                # 兜底：宁可费钱，不可丢上下文 ✓ —— 但要打警告 ✗（不然缓存没救回来都不知道 ✓）
+                logger.warning("[mindscape_groupctx] 挂 extra_user_content_parts 失败（缓存会吃亏），退回 system_prompt: %s", str(e)[:90])
+                request.system_prompt = ((request.system_prompt or "") + chr(10)
+                                         + sys_tag(chr(10).join(lines)))
+            if hist_imgs:
+                try:
+                    urls = getattr(request, "image_urls", None)
+                    if urls is None:
+                        urls = []
+                        request.image_urls = urls
+                    for _p, _w, _t in hist_imgs:
+                        if _p not in urls:
+                            urls.append(_p)
+                except Exception as exc:
+                    logger.warning("[mindscape_groupctx] 历史图挂载失败: %s", str(exc)[:120])
+            logger.info("[mindscape_groupctx] 注入 self=%s 群=%s 历史=%d 条 引用=%s 历史图=%d",
+                        event.get_self_id(), gid, len(recs),
+                        ("自己发的图" if (q_quoted and q_img and q_mine) else
+                         "别人的图" if (q_quoted and q_img) else "无"),
+                        len(hist_imgs))
+        except Exception as exc:
+            logger.warning("[mindscape_groupctx] 注入失败: %s", str(exc)[:120])
+
+
+# ==== from plugins/BlockMixin.py ====
 class BlockMixin:
     def setup(self, context):
         self.bl_on, self.bl_table = bl_load_config()
@@ -3521,6 +4830,7 @@ class BlockMixin:
             logger.warning("[mindscape_block] 拦截异常，已放行: %s", str(e)[:120])
 
 
+# ==== from plugins/GuardMixin.py ====
 class GuardMixin:
     def setup(self, context):
 
@@ -3539,8 +4849,8 @@ class GuardMixin:
                     len(self.patterns), self.g_send, armed)
 
     def _ms_hit(self, text):
-        """这条文本是不是框架报错（结果管线与 send 级兜底共用同一套判据）。"""
-        return is_error_text(text, self.patterns, self.regex)
+        """这条文本该不该拦：框架报错 **或** 漏出来的工具调用标记（两层共用同一套判据 ✓）。"""
+        return is_error_text(text, self.patterns, self.regex) or has_tool_leak(text)
 
     def _ms_arm_send_guard(self):
         """装 send 级兜底（幂等）。平台事件类这时可能还没 import，等下面那个钩子再补一次。"""
@@ -3584,13 +4894,51 @@ class GuardMixin:
             if result is None:
                 return
             txt = result.get_plain_text() or ""
+            # （2026-10-27 已删：一次性诊断 [msdiag] —— 会把出站正文写进日志 ✗）
             if not txt.strip():
                 return
-            if is_error_text(txt, self.patterns, self.regex):
+            # ⭐ 出站总整理：私有标签/思考 → `|||` 去掉 → markdown 标记扒掉 ✓
+            #   2026-10-17 主人定的规矩 + 两条真事故驱动的（详见 normalize_outbound 的注释 ✓）
+            #   为什么放这儿：本钩子 priority=**999**（仅次于 silence 的 1000）⇒
+            #   **所有插件的最终出站都要从它下面过** ⇒ 是唯一能兜住"新插件忘了清"的位置 ✓
+            #   ⚠️ 策略：**扒掉标记、留下她真正要说的话** ✓ 不是整条丢掉 ✗
+            _cleaned, _hits = normalize_outbound(txt)
+            if _hits:
+                logger.warning("[mindscape_guard] 出站整理: %s", redact(txt))
+                put_plain_text(result, _cleaned)
+                txt = _cleaned
+                if not txt.strip():
+                    # 整理完啥也不剩（她本来就只想发个标记）⇒ 那就不该发 ✓
+                    self.blocked += 1
+                    logger.warning("[mindscape_guard] 整理完只剩标记 ⇒ 整条不发")
+                    event.clear_result()
+                    event.stop_event()
+                    return
+            leak = has_tool_leak(txt)
+            # ⭐ 登记「本轮已经把正文发出去了」—— 给救援模块用 ✓
+            #   为什么在这儿：本钩子 **priority=999** ⇒ 真有字要发时一定会走到这一步 ✓
+            #   （`receive` 那边靠它判断「她其实说过了」，免得**再补一句**造成"精分" ✗
+            #     —— 2026-10-17 真事故：她调了个不存在的工具 ⇒ 那步返回空 ⇒ 救援另生成一句 ✗）
+            if txt.strip():
+                try:
+                    _rs = globals().get("rc_mark_text_sent")
+                    if _rs is None:
+                        import sys as _gsys
+                        for _gn, _gm in list(_gsys.modules.items()):
+                            if _gn.endswith("mindscape_rescue"):
+                                _rs = getattr(_gm, "rc_mark_text_sent", None)
+                                if _rs is not None:
+                                    break
+                    if _rs is not None:
+                        _rs(event.get_self_id(), event.get_group_id())
+                except Exception:
+                    pass
+            if leak or is_error_text(txt, self.patterns, self.regex):
                 self.blocked += 1
                 # S03: 只记录脱敏摘要，避免上游报错里夹带的密钥进日志
                 logger.warning(
-                    "[mindscape_guard] 拦下报错（第 %d 条）: %s",
+                    "[mindscape_guard] 拦下%s（第 %d 条）: %s",
+                    "工具标记泄漏" if leak else "报错",
                     self.blocked,
                     redact(txt),
                 )
@@ -3600,6 +4948,154 @@ class GuardMixin:
             logger.warning("[mindscape_guard] 检查失败: %s", str(e)[:120])
 
 
+# ==== from plugins/SilenceMixin.py ====
+class SilenceMixin:
+    def setup(self, context):
+
+        self.si_on, self.si_token, self.si_targets, self.si_prompt = si_load_config()
+        self.si_count = 0
+        logger.info("[mindscape_silence] loaded | enabled=%s token=%s targets=%d",
+                    self.si_on, self.si_token, len(self.si_targets))
+        scope_warn(logger, "mindscape_silence", self.si_targets, self.si_on)
+
+    def _si_hit(self, event):
+        if not self.si_on:
+            return False
+        return scope_hit(self.si_targets, event.get_self_id())
+
+    @filter.on_llm_request(priority=SI_PRIORITY)
+    async def si_grant(self, event: AstrMessageEvent, request):
+        """把「可以真的不说话」的出口告诉模型。"""
+        try:
+            if not self._si_hit(event):
+                return
+            if event.get_extra("cron_job"):
+                if si_attach(request, SI_CRON_NOTE, SI_CRON_NOTE.splitlines()[0]):
+                    logger.info("[mindscape_silence] 冒泡轮：不给令牌（不调工具即沉默）| bot=%s",
+                                event.get_self_id())
+                return
+            if si_attach(request, self.si_prompt, self.si_token):
+                logger.info("[mindscape_silence] 回复轮：已授予沉默权 | bot=%s",
+                            event.get_self_id())
+        except Exception as e:
+            logger.warning("[mindscape_silence] 注入失败: %s", str(e)[:120])
+
+    @filter.on_decorating_result(priority=1000)
+    async def si_block(self, event: AstrMessageEvent):
+        try:
+            if not self._si_hit(event):
+                return
+            result = event.get_result()
+            if result is None:
+                return
+            txt = result.get_plain_text() or ""
+            if not txt.strip():
+                return
+            if si_is_silence(txt, self.si_token) or si_is_ooc_silence(txt):
+                self.si_count += 1
+                logger.info("[mindscape_silence] 真静默（第 %d 次%s）| bot=%s",
+                            self.si_count,
+                            "" if si_is_silence(txt, self.si_token) else "，动作描写",
+                            event.get_self_id())
+                event.clear_result()
+                event.stop_event()
+                return
+            # 令牌混在正文里：剃掉它，绝不让它出现在群里
+            if self.si_token.lower() in txt.lower():
+                for comp in (getattr(result, "chain", None) or []):
+                    t = getattr(comp, "text", None)
+                    if isinstance(t, str) and t.strip():
+                        comp.text = si_strip(t, self.si_token)
+                # 剃完只剩空白 —— 那它本来就是想沉默（只是令牌形式没被上面认出来，
+                # 比如尾部多了零宽字符）。按真静默处理，否则会留下一条「空回复」：
+                # 用户看到的是「叫它不理」，日志里也什么都没有。
+                if not si_norm(result.get_plain_text() or ""):
+                    self.si_count += 1
+                    logger.info("[mindscape_silence] 真静默（第 %d 次，令牌带杂字）| bot=%s",
+                                self.si_count, event.get_self_id())
+                    event.clear_result()
+                    event.stop_event()
+        except Exception as e:
+            logger.warning("[mindscape_silence] 拦截失败: %s", str(e)[:120])
+
+
+# ==== from plugins/VisionMixin.py ====
+class VisionMixin:
+    def setup(self, context):
+        self.vs_on, self.vs_targets = vs_load_config()
+        logger.info("[mindscape_vision] loaded | enabled=%s | targets=%s",
+                    self.vs_on, self.vs_targets or "全部")
+        scope_warn(logger, "mindscape_vision", self.vs_targets, self.vs_on)
+
+    def _vs_hit(self, event):
+        if not self.vs_on:
+            return False
+        return scope_hit(self.vs_targets, event.get_self_id())
+
+    @filter.on_llm_request(priority=VS_PRIORITY)
+    async def vs_hint(self, event: AstrMessageEvent, request):
+        """有图 → 提醒「先查再认」；**没图但正文长得像有图** → 明确标注「那只是文字」✓。"""
+        try:
+            if not self._vs_hit(event):
+                return
+            urls = getattr(request, "image_urls", None)
+            # ⚠️ 先过**格式闸门**（2026-10-14 那次"她不回消息"的真凶 ✓）：
+            #    不合规的图必须在下发前剔掉，否则整轮请求 400 全灭 ✗
+            if urls:
+                kept, dropped = await asyncio.to_thread(
+                    vs_filter_images, list(urls), event.get_self_id())
+                if dropped:
+                    request.image_urls = kept
+                    urls = kept
+            if urls:
+                for index, ref in enumerate(urls):
+                    preview = await asyncio.to_thread(vs_compact_image, str(ref))
+                    if preview:
+                        urls[index] = preview
+            if vs_has_image(event):
+                if vs_attach(request, VS_HINT, VS_MARK):
+                    logger.info("[mindscape_vision] 有图：已提醒先查再认 | bot=%s",
+                                event.get_self_id())
+                return
+            # 本轮**没有图**：正文里若出现像图片/附件的字样，由代码认出来并标注「那只是文字」✓
+            fake = VS_FAKE_RE.search(str(getattr(event, "message_str", "") or ""))
+            if not fake:
+                return
+            if vs_attach(request, VS_TEXT_HINT % fake.group(0)[:40], VS_TEXT_MARK):
+                logger.info("[mindscape_vision] 正文像附件、本轮无图 → 已标注为文字 | bot=%s | 命中=%s",
+                            event.get_self_id(), fake.group(0)[:40])
+        except Exception as e:
+            logger.warning("[mindscape_vision] 注入失败: %s", str(e)[:120])
+
+    @filter.on_llm_response()
+    async def vs_image_error_retry(self, event, response):
+        """**B 层兜底**：图不合规把整轮打挂了 ⇒ 去掉图重答一次 ✗
+
+        ⚠️ 2026-10-14 真事故：那一轮所有模型调用全 400（`unsupported image`），
+           `guard` 又把报错拦住（不进群 ✓）⇒ 主人只看到「她不回消息、也不报错」✗
+        ⇒ A 层（格式闸门）治根；这一层是**万一漏网时她还能开口**的保险 ✓
+        ⚠️ 每条消息**只重试一次**（`VS_RETRY_FLAG`）—— 绝不允许变成循环请求 ✗
+        """
+        try:
+            if not self.vs_on:
+                return
+            text = str(getattr(response, "completion_text", "") or "")
+            if not vs_is_image_error(text):
+                return
+            if getattr(event, VS_RETRY_FLAG, False):
+                logger.warning("[mindscape_vision] 图不合规，但这条已经重试过 ⇒ 不再重试 ✗")
+                return
+            setattr(event, VS_RETRY_FLAG, True)
+            logger.warning("[mindscape_vision] 图不合规把整轮打挂了 ⇒ 去掉图重答一次 | bot=%s",
+                           event.get_self_id())
+            again = await vs_retry_without_image(self, event, response)
+            if again:
+                response.completion_text = again
+        except Exception as e:
+            logger.warning("[mindscape_vision] 去图重答钩子异常: %s", str(e)[:120])
+
+
+# ==== from plugins/MemoryMixin.py ====
 class MemoryMixin:
     def setup(self, context):
 
@@ -3821,6 +5317,23 @@ class MemoryMixin:
                         logger.warning("[mindscape_memory] 挂 extra_user_content_parts 失败"
                                        "（缓存会吃亏），退回 system_prompt: %s", str(e)[:90])
                         request.system_prompt = (request.system_prompt or old) + block
+            # ⭐ 时间锚点 —— **放在整个注入的最末尾** ✓（主人 2026-10-22 定）
+            #   为什么必须最后：日期一天一变 ✗ 放前面 ⇒ 每天第一次请求就把前面全部重算
+            #   ⇒ 缓存整个击穿（那是最贵的一笔）✗
+            #   ⚠️ 只给日期、只认北京时间（见 today_line 的注释 ✓）
+            try:
+                _line = today_line()
+                _tp2 = getattr(request, "extra_user_content_parts", None)
+                _have = (TODAY_MARK in (getattr(request, "system_prompt", "") or "")
+                         or any(TODAY_MARK in str(getattr(p, "text", "")) for p in (_tp2 or [])))
+                if not _have:
+                    from astrbot.core.agent.message import TextPart
+                    if _tp2 is None:
+                        _tp2 = []
+                        request.extra_user_content_parts = _tp2
+                    _tp2.append(TextPart(text=sys_tag(_line)))
+            except Exception as e:
+                logger.warning("[mindscape_memory] 注入日期失败: %s", str(e)[:90])
             logger.info("[mindscape_memory] %s 注入 %d 字记忆 / %d 字摘要 / %d 字账本"
                         " / %d 字风格 / %d 字人物",
                         bot.get("name") or "你", sizes[0], sizes[1], sizes[2], sizes[3],
@@ -3829,6 +5342,7 @@ class MemoryMixin:
             logger.warning("[mindscape_memory] 人物注入失败: %s", str(e)[:120])
 
 
+# ==== from plugins/PrivacyMixin.py ====
 class PrivacyMixin:
     def setup(self, context):
         logger.info("[mindscape_privacy] loaded")
@@ -3845,11 +5359,35 @@ class PrivacyMixin:
         message = str(getattr(event.message_obj, "message_str", "") or "")
         if not any(str(word) in message for word in gate.get("ask_words") or []):
             return
+        parts = []
         hint = str(gate.get("ask_hint") or "").strip()
         if hint:
-            request.system_prompt = (request.system_prompt or "") + "\n\n" + hint
+            parts.append(hint)
+
+        # ⭐ 把**真码**放进提示里（她要不要给仍然自己决定 ✓）
+        code, expiry = pg_live_code(event.get_self_id())
+        if code:
+            try:
+                when = datetime.datetime.fromtimestamp(expiry.timestamp()).strftime("%H:%M") if expiry else ""
+            except Exception:  # noqa: BLE001
+                when = ""
+            parts.append(
+                "【系统给的原文，仅供你照抄】**记忆 / 印象闸门**的口令是：%s%s。"
+                "**要给他就原样抄这一串**（别改字母、别自己编）。"
+                "⚠️ 你账本里可能还记着**别的用途**的口令（比如面板 / 后台 / 心情理由那种），"
+                "**那些开不了记忆和印象，别拿错**。"
+                "**不想给就照旧糊弄/拒绝，也给完全没问题** ✓"
+                % (code, ("（%s 到期）" % when) if when else "")
+            )
+        else:
+            parts.append("【系统给的原文】你现在账本里**没有有效口令**（未生成或已过期）。"
+                         "你可以直说没有，**不要自己编一串** ✗")
+
+        if parts:
+            request.system_prompt = (request.system_prompt or "") + "\n\n" + "\n".join(parts)
 
 
+# ==== from plugins/StickersMixin.py ====
 class StickersMixin:
     def setup(self, context):
 
@@ -3860,6 +5398,10 @@ class StickersMixin:
         os.makedirs(self.dir, exist_ok=True)
         self.seen_ok = set()        # 已入库（键 = 分类:md5）
         self.seen_no = set()        # 明确拒绝（重启后也不清）
+        # 2026-10-27（P3）：再存一份**插入顺序**（dict 当有序集合用）⇒ 截断 3000 条时
+        #   砍掉的是"最旧的"，而不是"md5 字典序最小的"（后者纯属偶然 ✗）
+        self.seen_order_ok = {}
+        self.seen_order_no = {}
         self.seen = self._load_seen()
         self._bg = set()            # 后台采集任务，留引用防被 GC 掉
         logger.info(
@@ -3909,31 +5451,62 @@ class StickersMixin:
         except Exception:
             # 图库读不出来就不敢动去重表：全按拒绝保留，宁可少收也不重复烧 API
             self.seen_ok, self.seen_no = set(), keys
+            self.seen_order_ok, self.seen_order_no = {}, {k: 1 for k in keys}
             return keys
         if legacy:
             # 老格式分不清来源：在图库里的算入库，其余**保守归入拒绝**
             self.seen_ok = set(k for k in keys if k in live)
+            self.seen_order_ok = {k: 1 for k in keys if k in live}
             self.seen_no = keys - self.seen_ok
+            self.seen_order_no = {k: 1 for k in keys if k in self.seen_no}
             logger.info("[mindscape_stickers] 去重表迁移：老平表 %d 条 → 入库 %d / 拒绝 %d",
                         len(keys), len(self.seen_ok), len(self.seen_no))
             self._save_seen()
             return keys
         acc = set(d.get("accepted") or [])
         self.seen_ok = set(k for k in acc if k in live)
+        self.seen_order_ok = {k: 1 for k in acc if k in live}
         self.seen_no = set(d.get("rejected") or [])
+        self.seen_order_no = {k: 1 for k in (d.get("rejected") or [])}
         if self.seen_ok != acc:
             logger.info("[mindscape_stickers] 去重表自愈：入库 %d -> %d（清掉 %d 条墓碑），"
                         "拒绝记录 %d 条原样保留",
                         len(acc), len(self.seen_ok), len(acc) - len(self.seen_ok),
                         len(self.seen_no))
             self._save_seen()
-        return self.seen_ok | self.seen_no
+        # 「图库里现有的」也算处理过 —— 去重键是 `分类:内容 md5`，所以**跨分类**收同一张图
+        # 不受影响（那是设计允许的：同一张图可以同时属于两个不同分类）。
+        # 2026-10-12 补：以前只认表里那几条，于是**导入脚本 / 手工放进图库**的图会被当成
+        # 「没见过」，再收一次就多出一条同内容不同名的重复条目（在主人的库上实测到 6 组，
+        # 其中两组名字不同、条目同时在库）。把 live 一并算进已处理，这条路径闭合。
+        return self.seen_ok | self.seen_no | live
 
     def _save_seen(self):
+        """写去重表 —— **原子写 + 截断按时间**（2026-10-27 修 · P3）。
+
+        ① 原来是 `open(..., "w")` 直接覆盖 ⇒ 写一半崩掉就把整张表弄坏 ✗
+           ⇒ 改成「写临时文件 → fsync → os.replace」原子替换 ✓
+        ② 原来是 `sorted(...)[-3000:]` —— 按 **md5 字典序**砍，砍掉哪些纯属偶然 ✗
+           ⇒ 现在按**插入顺序**保留最近的（set 本身无序，所以先转 list 再取尾；
+              `_mark_seen` 用 dict 记录插入序，见下）✓
+        """
         try:
-            with open(self.seen_path, "w", encoding="utf-8") as f:
-                json.dump({"accepted": sorted(self.seen_ok)[-3000:],
-                           "rejected": sorted(self.seen_no)[-3000:]}, f)
+            # 兼容：自检/测试里的桩对象可能只有 seen_ok/seen_no ⇒ 取不到顺序表就退回排序 ✓
+            seq_ok = getattr(self, "seen_order_ok", None)
+            seq_no = getattr(self, "seen_order_no", None)
+            ok_list = (list(seq_ok)[-3000:] if seq_ok
+                       else sorted(getattr(self, "seen_ok", set()))[-3000:])
+            no_list = (list(seq_no)[-3000:] if seq_no
+                       else sorted(getattr(self, "seen_no", set()))[-3000:])
+            tmp = self.seen_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"accepted": ok_list, "rejected": no_list}, f)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            os.replace(tmp, self.seen_path)
         except Exception:
             pass
 
@@ -3945,8 +5518,14 @@ class StickersMixin:
         """
         if accepted:
             self.seen_ok.add(key)
+            if not hasattr(self, "seen_order_ok"):      # 桩对象兼容（自检里只给了 seen_ok）✓
+                self.seen_order_ok = {}
+            self.seen_order_ok[key] = 1
         else:
             self.seen_no.add(key)
+            if not hasattr(self, "seen_order_no"):
+                self.seen_order_no = {}
+            self.seen_order_no[key] = 1
         self.seen.add(key)
         self._save_seen()
     def _add_index(self, fname, category, verdict):
@@ -4108,7 +5687,26 @@ class StickersMixin:
             if resp.status_code != 200:
                 logger.warning("[mindscape_stickers] 判断 API %s", resp.status_code)
                 return None
-            msg = resp.json()["choices"][0]["message"]
+            _d = resp.json()
+            # 2026-10-27：直连调用补记账（原来官方照收钱、本地不记 ✗）
+            #   ⚠️ 用**顶层 import** 的 log_llm_usage（函数体内 import 会被构建器漏掉 ✗）
+            try:
+                log_llm_usage(_d, "stickers")
+            except Exception:
+                pass
+            # ⚠️ 2026-10-22 主人查账：**这三处直连 provider 的调用原本一行账都不打** ✗
+            #    实测（探针）：30 秒内 3 次请求，① 护栏只记到 2 条 ⇒ 漏的正是这条路 ✓
+            #    ⇒ 只补**用量日志**（不改逻辑）；文案跟宿主那一套对齐，方便一起汇总 ✓
+            try:
+                _u = (_d.get("usage") or {})
+                logger.info("[msusage] %s 未命中 %s ｜ 命中缓存 %s ｜ 输出 %s",
+                            "judge(识图判断)",
+                            _u.get("prompt_cache_miss_tokens"),
+                            _u.get("prompt_cache_hit_tokens"),
+                            _u.get("completion_tokens"))
+            except Exception:
+                pass
+            msg = _d["choices"][0]["message"]
             txt = (msg.get("content") or "").strip()
             if not txt:
                 txt = (msg.get("reasoning_content") or "").strip()
@@ -4121,6 +5719,7 @@ class StickersMixin:
         return None
 
 
+# ==== from plugins/StickerUseMixin.py ====
 class StickerUseMixin:
     def setup(self, context):
 
@@ -4169,6 +5768,9 @@ class StickerUseMixin:
         tags = [x.strip()[:10] for x in raw.replace("，", ",").split(",") if x.strip()][:6]
         if not tags:
             tags = ["私藏", "表情包"]
+        # desc 是**挑图时模型唯一读的实质字段**（见 _pick 的候选行：只渲染 tags[:5] + desc[:60]）——
+        # 所以让模型自己写「什么场景用」，别再拿标签抄一遍（2026-10-12 修）。
+        desc = str(kwargs.get("desc") or "").strip()[:80]
         cat = self._category_of(event.get_self_id())
         if not cat:
             return "你还没有配置表情包分类，存不了。"
@@ -4203,7 +5805,9 @@ class StickerUseMixin:
                     return "这张我已经收过啦。"
                 shutil.copy2(path, dst)
                 idx.append({"file": fname, "category": cat, "name": name,
-                            "tags": tags, "desc": "收的：" + (raw or name)[:80]})
+                            "tags": tags,
+                            # 模型写了场景就用它；没写才退回旧写法（老行为不变 ✓）
+                            "desc": desc or ("收的：" + (raw or name)[:80])})
                 save_index(self.index_path, idx)
         except Exception as e:
             return "存图失败：" + str(e)[:60]
@@ -4284,7 +5888,15 @@ class StickerUseMixin:
             if not pool:
                 return
             reply = (result.get_plain_text() or "")[:200]
-            fname = await self._pick(reply, pool)
+            # 2026-10-27 修（P2-4）：配图只是**加分项**，但它挂在 decorating 钩子里
+            #   同步等一次 LLM 调用 ⇒ 第三方 API 慢就把这条回复一起拖住（原来 timeout=90s ✗）
+            #   ⇒ 整个挑图套一个**硬上限**：超时就退回本地兜底（池里第一张），
+            #     绝不让一张表情包决定这条消息什么时候发出去 ✓
+            try:
+                fname = await asyncio.wait_for(self._pick(reply, pool), timeout=PICK_HARD_TIMEOUT)
+            except Exception:
+                fname = (pool[0] or {}).get("file") if pool else None
+                logger.info("[mindscape_sticker_use] 挑图超过 %.0fs，改用兜底图", PICK_HARD_TIMEOUT)
             if not fname:
                 return
             path = os.path.join(self.dir, fname)
@@ -4345,7 +5957,7 @@ class StickerUseMixin:
             "{reply}", reply or "（没说什么）"
         ).replace("{candidates}", chr(10).join(lines))
         try:
-            async with httpx.AsyncClient(timeout=90) as cli:
+            async with httpx.AsyncClient(timeout=5) as cli:
                 resp = await cli.post(
                     api_base + "/chat/completions",
                     headers={"Authorization": "Bearer " + key},
@@ -4357,7 +5969,27 @@ class StickerUseMixin:
                 )
             if resp.status_code != 200:
                 return None
-            msg = resp.json()["choices"][0]["message"]
+            _d = resp.json()
+            # 2026-10-27：直连调用补记账（原来官方照收钱、本地不记 ✗）
+            #   ⚠️ 用**顶层 import** 的 `log_llm_usage` —— 写函数体内 import 的话，
+            #   构建器只剥顶层、合并产物里没有 mindscape_core ⇒ ModuleNotFoundError ⇒ 静默失效 ✗
+            try:
+                log_llm_usage(_d, "sticker_use")
+            except Exception:
+                pass
+            # ⚠️ 2026-10-22 主人查账：**这三处直连 provider 的调用原本一行账都不打** ✗
+            #    实测（探针）：30 秒内 3 次请求，① 护栏只记到 2 条 ⇒ 漏的正是这条路 ✓
+            #    ⇒ 只补**用量日志**（不改逻辑）；文案跟宿主那一套对齐，方便一起汇总 ✓
+            try:
+                _u = (_d.get("usage") or {})
+                logger.info("[msusage] %s 未命中 %s ｜ 命中缓存 %s ｜ 输出 %s",
+                            "pick(表情挑选)",
+                            _u.get("prompt_cache_miss_tokens"),
+                            _u.get("prompt_cache_hit_tokens"),
+                            _u.get("completion_tokens"))
+            except Exception:
+                pass
+            msg = _d["choices"][0]["message"]
             txt = (msg.get("content") or "").strip() or (msg.get("reasoning_content") or "").strip()
         except Exception as e:
             logger.warning("[mindscape_sticker_use] 选图异常: %s", str(e)[:120])
@@ -4399,6 +6031,7 @@ class StickerUseMixin:
         return str(best.get("file"))
 
 
+# ==== from plugins/FormatMixin.py ====
 class FormatMixin:
     def setup(self, context):
 
@@ -4411,12 +6044,80 @@ class FormatMixin:
                     len(self.targets), self.f_np or "关")
         scope_warn(logger, "mindscape_format", self.targets)
 
+        # ⭐ 把出站整形登记给 guard 的内置发送工具补丁 ✓
+        #   为什么必须做：`send_message_to_user` **直接发消息**，不经过 on_decorating_result
+        #   ⇒ 下面那个 flatten_result 看不到它 ⇒ 句号照发 ✗
+        #   （2026-10-16 实测：她 13 次调用里 2 条带句尾句号 ✓）
+        #   ⚠️ 取法是三元兜底（照本仓通用写法 ✓）：**构建产物是单一大文件**，
+        #      跨模块 import 已被 build_plugin 剥掉 ⇒ 合并后它就是个模块级函数，
+        #      直接查 globals() 即可；开发态（源码树里逐模块加载）才走 import ✓
+        #   ⚠️ 登记的是「取实例的函数」，不是 self —— 补丁可能在 setup 之前就装好，
+        #      存 self 会拿到 None；存函数每次现取 ⇒ 不会陈旧 ✓
+        try:
+            _ms_reg = globals().get("ms_set_text_formatter")
+            if _ms_reg is None:
+                import sys as _ms_sys
+                for _mn, _mm in list(_ms_sys.modules.items()):
+                    if _mn.endswith("mindscape_guard"):
+                        _ms_reg = getattr(_mm, "ms_set_text_formatter", None)
+                        if _ms_reg is not None:
+                            break
+            if _ms_reg is not None:
+
+                def _ms_format_provider(_get=(lambda: self)):
+                    cur = _get()
+                    if cur is None:
+                        return None
+                    return cur.ms_format_text
+
+                _ms_reg(_ms_format_provider)
+                logger.info("[mindscape_format] 已登记出站整形（内置发送工具同口径）")
+            else:
+                logger.warning("[mindscape_format] 找不到 ms_set_text_formatter —— 内置发送工具不会去句号")
+        except Exception as e:
+            logger.warning("[mindscape_format] 登记出站整形失败: %s", str(e)[:100])
+
+        # ⭐ 把「句尾去句号」的作用域也登记成模块级**单一真值** ✓
+        #   给那些**没有 self 的模块级钩子**用（mention 的 ||| 拆分 ✓）——
+        #   否则它只能自己再读一遍配置，口径早晚漂移 ✗
+        try:
+            if "MS_FORMAT_NP" in globals():
+                globals()["MS_FORMAT_NP"] = list(self.f_np)
+                logger.info("[mindscape_format] 已登记去句号作用域：%s", self.f_np or "关")
+        except Exception as e:
+            logger.warning("[mindscape_format] 登记去句号作用域失败: %s", str(e)[:100])
+
+    def ms_format_text(self, context, text, kwargs):
+        """给「工具直接发话」那条路用的整形：压平 +（作用域内）去掉句尾句号。
+
+        ⚠️ 与 flatten_result **同源同规矩** ✓ —— 两个通道必须一套口径，
+        否则同一句话走哪条路结果不一样（2026-10-16 就是这么漏的 ✗）。
+        """
+        if not isinstance(text, str) or not text.strip():
+            return text
+        self_id = None
+        try:
+            self_id = context.context.event.get_self_id()
+        except Exception:
+            pass
+        if self_id is None:
+            return text              # 拿不到身份 ⇒ 不猜，原样放行 ✓
+        join_with = self.f_c.get("join_with") or "，"
+        drop = bool(self.f_c.get("drop_last_if_short", False))
+        short_len = int(self.f_c.get("short_len") or 8)
+        new = flatten(text, join_with, drop, short_len)
+        if self.f_np and scope_hit(self.f_np, self_id):
+            new = drop_period(new)
+        return new
+
     @filter.on_decorating_result(priority=900)
     async def flatten_result(self, event: AstrMessageEvent):
         try:
             if not scope_hit(self.targets, event.get_self_id()):
                 return
             result = event.get_result()
+            # （2026-10-27 已删：一次性诊断 [msdiag] —— 它把**每条出站正文前 200 字**写进日志 ✗
+            #   与 trace.py「只记尺寸与耗时、不记正文」的承诺冲突；排查期已过，按原计划撤掉 ✓）
             if result is None or not result.is_llm_result():
                 return
             chain = getattr(result, "chain", None)
@@ -4439,6 +6140,91 @@ class FormatMixin:
             logger.warning("[mindscape_format] 处理失败: %s", str(e)[:120])
 
 
+# ==== from plugins/TraceMixin.py ====
+class TraceMixin:
+    def setup(self, context):
+        c = cfg.section("trace")
+        self.tr_on = True if c.get("enabled") is None else bool(c.get("enabled"))
+        self.tr_warn_ms = int(c.get("warn_ms") or DEFAULT_WARN_MS)
+        self.tr_warn_chars = int(c.get("warn_chars") or DEFAULT_WARN_CHARS)
+        self.tr_pending = {}
+        logger.info(
+            "[mindscape_trace] loaded | enabled=%s | 慢于 %dms 或 system_prompt"
+            " 超过 %d 字时改成 WARNING",
+            self.tr_on, self.tr_warn_ms, self.tr_warn_chars)
+
+    def tr_label(self, event):
+        """日志里区分两个 bot 的那一列。"""
+        return "self=%s 群=%s" % (event.get_self_id(),
+                                  event.get_group_id() or "-")
+
+    def tr_remember(self, key, info):
+        self.tr_pending[key] = info
+        # 失败/中断的轮次永远等不到响应 —— 别让它把内存攒起来
+        if len(self.tr_pending) > TRACE_PENDING_MAX:
+            for k in list(self.tr_pending)[:-TRACE_PENDING_MAX // 2]:
+                self.tr_pending.pop(k, None)
+
+    @filter.on_llm_request(priority=TRACE_PRIORITY)
+    async def tr_measure_request(self, event: AstrMessageEvent,
+                                 request: ProviderRequest):
+        if not self.tr_on:
+            return
+        try:
+            hn, hc = tr_hist(request)
+            info = {
+                "t": time.time(),
+                "sys": len(request.system_prompt or ""),
+                "ctx": len(request.contexts or []),
+                "ctx_chars": tr_ctx_chars(request.contexts),
+                "hist_n": hn,
+                "hist_c": hc,
+                "tools": tr_tool_count(request),
+                "user": len(request.prompt or ""),
+            }
+            self.tr_remember(tr_key(event), info)
+            event.set_extra(TRACE_KEY, info)
+            logger.info(
+                "[mindscape_trace] 出站 %s sys=%d字 会话=%d条/%d字 上下文=%d条 工具=%d 输入=%d字"
+                " sys指纹=%s",
+                self.tr_label(event), info["sys"], info["hist_n"],
+                info["hist_c"], info["ctx"], info["tools"], info["user"],
+                tr_fp(request.system_prompt or ""))
+        except Exception as e:
+            logger.warning("[mindscape_trace] 记录请求失败: %s", str(e)[:120])
+
+    @filter.on_llm_response()
+    async def tr_measure_response(self, event: AstrMessageEvent, response):
+        if not self.tr_on:
+            return
+        try:
+            info = self.tr_pending.pop(tr_key(event), None)
+            if not isinstance(info, dict):
+                info = event.get_extra(TRACE_KEY)
+            if not isinstance(info, dict) or not info.get("t"):
+                logger.warning(
+                    "[mindscape_trace] 收到响应但没找到本轮的请求记录（出站日志可能没打）| %s",
+                    self.tr_label(event))
+                return
+            ms = int((time.time() - float(info["t"])) * 1000)
+            slow = ms >= self.tr_warn_ms
+            fat = int(info.get("sys") or 0) >= self.tr_warn_chars
+            line = ("[mindscape_trace] %s %s 耗时=%.2fs sys=%d字"
+                    " 会话=%d条/%d字 工具=%d 输入=%d字%s")
+            args = ("SLOW" if slow else ("FAT" if fat else "完成"),
+                    self.tr_label(event), ms / 1000.0,
+                    info.get("sys") or 0, info.get("hist_n") or 0,
+                    info.get("hist_c") or 0, info.get("tools") or 0,
+                    info.get("user") or 0, tr_usage(response))
+            if slow or fat:
+                logger.warning(line, *args)
+            else:
+                logger.info(line, *args)
+        except Exception as e:
+            logger.warning("[mindscape_trace] 记录耗时失败: %s", str(e)[:120])
+
+
+# ==== from plugins/RescueMixin.py ====
 class RescueMixin:
     def setup(self, context):
         self.r_cfg = cfg.section("rescue") or {}
@@ -4484,6 +6270,13 @@ class RescueMixin:
             # 规矩：**本轮只要已经用「出站类工具」说过话，就不许补** ✓（跨钩子状态存模块级 ✓）。
             if rc_sent_recent(event):
                 logger.info("[mindscape_rescue] 本轮已用工具说过话 → 不补 ✓")
+                return
+            # ⭐ 2026-10-17 新增：**本轮已经发出过正文** ⇒ 更不许补 ✗
+            #   真事故（主人报「精分」）：她调了个**不存在的工具**（把标签当工具 ✗）
+            #   ⇒ 那一步返回空 ⇒ 这里以为她没说话、另问一次模型 ⇒ 群里**两句不同来源** ✗
+            #   （第 1 条是她的真实回答，第 2 条是救援产物 ✓）
+            if rc_text_sent_recent(event):
+                logger.info("[mindscape_rescue] 本轮已发出过正文 → 不补（否则会精分 ✗）")
                 return
             text = await self._ask_once(event)
             if not text:
@@ -4550,6 +6343,9 @@ class RescueMixin:
                     parts.append(str(m["text"]))
             if parts:
                 event.set_extra("_ms_sent_text", " ".join(parts)[:300])
+            # （2026-10-27 已删：一次性诊断 [msdiag] —— 它把**工具参数原文**写进日志 ✗
+            #   与「日志不记正文」的承诺冲突；排查期已过，按原计划撤掉 ✓
+            #   ⚠️ 上面的 set_extra 是**功能**（抑制/去重用），不是日志，保留 ✓）
         except Exception:
             pass
 
@@ -4634,7 +6430,25 @@ class RescueMixin:
                 )
             if resp.status_code != 200:
                 return ""
-            msg = resp.json()["choices"][0]["message"]
+            _d = resp.json()
+            # 2026-10-27：直连调用补记账（原来官方照收钱、本地不记 ✗）
+            try:   # 2026-10-27：直连调用补记账（顶层 import ⇒ 合并后是全局 ✓）
+                log_llm_usage(_d, "rescue")
+            except Exception:
+                pass
+            # ⚠️ 2026-10-22 主人查账：**这三处直连 provider 的调用原本一行账都不打** ✗
+            #    实测（探针）：30 秒内 3 次请求，① 护栏只记到 2 条 ⇒ 漏的正是这条路 ✓
+            #    ⇒ 只补**用量日志**（不改逻辑）；文案跟宿主那一套对齐，方便一起汇总 ✓
+            try:
+                _u = (_d.get("usage") or {})
+                logger.info("[msusage] %s 未命中 %s ｜ 命中缓存 %s ｜ 输出 %s",
+                            "ask_once(救援补话)",
+                            _u.get("prompt_cache_miss_tokens"),
+                            _u.get("prompt_cache_hit_tokens"),
+                            _u.get("completion_tokens"))
+            except Exception:
+                pass
+            msg = _d["choices"][0]["message"]
             txt = (msg.get("content") or "").strip()
             if not txt:
                 txt = (msg.get("reasoning_content") or "").strip()
@@ -4677,324 +6491,7 @@ class RescueMixin:
             return ""
 
 
-class SilenceMixin:
-    def setup(self, context):
-
-        self.si_on, self.si_token, self.si_targets, self.si_prompt = si_load_config()
-        self.si_count = 0
-        logger.info("[mindscape_silence] loaded | enabled=%s token=%s targets=%d",
-                    self.si_on, self.si_token, len(self.si_targets))
-        scope_warn(logger, "mindscape_silence", self.si_targets, self.si_on)
-
-    def _si_hit(self, event):
-        if not self.si_on:
-            return False
-        return scope_hit(self.si_targets, event.get_self_id())
-
-    @filter.on_llm_request(priority=SI_PRIORITY)
-    async def si_grant(self, event: AstrMessageEvent, request):
-        """把「可以真的不说话」的出口告诉模型。"""
-        try:
-            if not self._si_hit(event):
-                return
-            if event.get_extra("cron_job"):
-                if si_attach(request, SI_CRON_NOTE, SI_CRON_NOTE.splitlines()[0]):
-                    logger.info("[mindscape_silence] 冒泡轮：不给令牌（不调工具即沉默）| bot=%s",
-                                event.get_self_id())
-                return
-            if si_attach(request, self.si_prompt, self.si_token):
-                logger.info("[mindscape_silence] 回复轮：已授予沉默权 | bot=%s",
-                            event.get_self_id())
-        except Exception as e:
-            logger.warning("[mindscape_silence] 注入失败: %s", str(e)[:120])
-
-    @filter.on_decorating_result(priority=1000)
-    async def si_block(self, event: AstrMessageEvent):
-        try:
-            if not self._si_hit(event):
-                return
-            result = event.get_result()
-            if result is None:
-                return
-            txt = result.get_plain_text() or ""
-            if not txt.strip():
-                return
-            if si_is_silence(txt, self.si_token) or si_is_ooc_silence(txt):
-                self.si_count += 1
-                logger.info("[mindscape_silence] 真静默（第 %d 次%s）| bot=%s",
-                            self.si_count,
-                            "" if si_is_silence(txt, self.si_token) else "，动作描写",
-                            event.get_self_id())
-                event.clear_result()
-                event.stop_event()
-                return
-            # 令牌混在正文里：剃掉它，绝不让它出现在群里
-            if self.si_token.lower() in txt.lower():
-                for comp in (getattr(result, "chain", None) or []):
-                    t = getattr(comp, "text", None)
-                    if isinstance(t, str) and t.strip():
-                        comp.text = si_strip(t, self.si_token)
-                # 剃完只剩空白 —— 那它本来就是想沉默（只是令牌形式没被上面认出来，
-                # 比如尾部多了零宽字符）。按真静默处理，否则会留下一条「空回复」：
-                # 用户看到的是「叫它不理」，日志里也什么都没有。
-                if not si_norm(result.get_plain_text() or ""):
-                    self.si_count += 1
-                    logger.info("[mindscape_silence] 真静默（第 %d 次，令牌带杂字）| bot=%s",
-                                self.si_count, event.get_self_id())
-                    event.clear_result()
-                    event.stop_event()
-        except Exception as e:
-            logger.warning("[mindscape_silence] 拦截失败: %s", str(e)[:120])
-
-
-class VisionMixin:
-    def setup(self, context):
-        self.vs_on, self.vs_targets = vs_load_config()
-        logger.info("[mindscape_vision] loaded | enabled=%s | targets=%s",
-                    self.vs_on, self.vs_targets or "全部")
-        scope_warn(logger, "mindscape_vision", self.vs_targets, self.vs_on)
-
-    def _vs_hit(self, event):
-        if not self.vs_on:
-            return False
-        return scope_hit(self.vs_targets, event.get_self_id())
-
-    @filter.on_llm_request(priority=VS_PRIORITY)
-    async def vs_hint(self, event: AstrMessageEvent, request):
-        """有图 → 提醒「先查再认」；**没图但正文长得像有图** → 明确标注「那只是文字」✓。"""
-        try:
-            if not self._vs_hit(event):
-                return
-            urls = getattr(request, "image_urls", None)
-            if urls:
-                for index, ref in enumerate(urls):
-                    preview = await asyncio.to_thread(vs_compact_image, str(ref))
-                    if preview:
-                        urls[index] = preview
-            if vs_has_image(event):
-                if vs_attach(request, VS_HINT, VS_MARK):
-                    logger.info("[mindscape_vision] 有图：已提醒先查再认 | bot=%s",
-                                event.get_self_id())
-                return
-            # 本轮**没有图**：正文里若出现像图片/附件的字样，由代码认出来并标注「那只是文字」✓
-            fake = VS_FAKE_RE.search(str(getattr(event, "message_str", "") or ""))
-            if not fake:
-                return
-            if vs_attach(request, VS_TEXT_HINT % fake.group(0)[:40], VS_TEXT_MARK):
-                logger.info("[mindscape_vision] 正文像附件、本轮无图 → 已标注为文字 | bot=%s | 命中=%s",
-                            event.get_self_id(), fake.group(0)[:40])
-        except Exception as e:
-            logger.warning("[mindscape_vision] 注入失败: %s", str(e)[:120])
-
-
-class GroupctxMixin:
-    def setup(self, context):
-        c = cfg.section("groupctx")
-        self.gc_on = bool(c.get("enabled"))
-        self.gc_path = gc_buffer_path(c)
-        self.gc_count = int(c.get("count") or DEFAULT_COUNT)
-        self.gc_window = int(c.get("window_sec") or DEFAULT_WINDOW)
-        self.gc_tail = int(c.get("tail_bytes") or DEFAULT_TAIL)
-        self.gc_mark = True if c.get("directness") is None else bool(c.get("directness"))
-        self.gc_targets = [str(x) for x in (c.get("targets") or [])]
-        self.gc_img_on = True if c.get("images") is None else bool(c.get("images"))
-        self.gc_img_max = int(c.get("image_max") or DEFAULT_IMG_MAX)
-        self.gc_img_window = int(c.get("image_window_sec") or DEFAULT_IMG_WINDOW)
-        self.gc_img_same = (DEFAULT_IMG_SAME if c.get("image_same_sender") is None
-                            else bool(c.get("image_same_sender")))
-        logger.info(
-            "[mindscape_groupctx] loaded | enabled=%s | buffer=%s | 最近 %d 条/%ds | 定向性=%s | 历史图=%s(max %d/%ds 同人=%s)",
-            self.gc_on, self.gc_path, self.gc_count, self.gc_window, self.gc_mark,
-            self.gc_img_on, self.gc_img_max, self.gc_img_window, self.gc_img_same)
-        scope_warn(logger, "mindscape_groupctx", self.gc_targets, self.gc_on)
-
-    @filter.on_llm_request(priority=GC_PRIORITY)
-    async def gc_inject(self, event: AstrMessageEvent, request: ProviderRequest):
-        try:
-            if not self.gc_on or not scope_hit(self.gc_targets, event.get_self_id()):
-                return
-            gid = event.get_group_id()
-            if gid is None:
-                return
-            # 自主冒泡轮不要群缓冲 —— 那会让它退化成「接别人的话」，
-            # 而这一轮的意义是自己找话题。
-            if event.get_extra("cron_job"):
-                return
-            now = time.time()
-            recs = gc_read_recent(self.gc_path, event.get_platform_name(),
-                                  str(gid), self.gc_count, self.gc_window,
-                                  self.gc_tail)
-            q_quoted, q_mine, q_img = gc_quote(event)
-            hist_refs = []
-            if self.gc_img_on and not gc_has_image(event) and not (q_quoted and q_img):
-                hist_refs = gc_history_images(
-                    recs, self.gc_img_window, self.gc_img_max * 3,
-                    sender=str(event.get_sender_id()) if self.gc_img_same else None)
-            hist_imgs = []
-            ref2path = {}
-            for _ref, _w, _t in hist_refs:
-                if len(hist_imgs) >= self.gc_img_max:
-                    break
-                _p = await gc_resolve_ref(_ref)
-                if _p:
-                    hist_imgs.append((_p, _w, _t))
-                    ref2path[str(_ref)] = _p
-            img_no = {}
-            for _k, (_p, _w, _t) in enumerate(hist_imgs, 1):
-                img_no[_p] = _k
-            lines = []
-            if self.gc_mark:
-                lines += ["", "【本条消息的定向性】", gc_head(event)]
-                if q_quoted and q_img:
-                    lines.append(gc_quote_note(q_mine))
-                    if q_mine and gc_quote_rewrite(request, True):
-                        logger.info("[mindscape_groupctx] 引用正文改写=自己发的图")
-            if recs:
-                lines.append("")
-                lines.append("【本群最近的真实聊天记录（用于理解上下文，不要逐条回应，也不要复述）】")
-                for r in recs:
-                    tag = " ".join("［附件%d］" % img_no[ref2path[str(x)]]
-                                   for x in (r.get("imgs") or []) if str(x) in ref2path)
-                    lines.append("[" + time.strftime("%H:%M:%S", time.localtime(float(r.get("ts") or now)))
-                                 + "] " + strip_invisible(str(r.get("who", "?")))[:16] + ": "
-                                 + strip_invisible(str(r.get("text", "")))[:200]
-                                 + (("  " + tag) if tag else ""))
-            if hist_imgs:
-                lines.append("")
-                lines.append("【上面历史里带的那几张图，按顺序就是附件 1…%d（标了［附件N］的那条就是它）】"
-                             % len(hist_imgs))
-                lines.append("本条消息时间：%s。历史图虽然可见，并不等于本条消息在请你评价它。"
-                             % time.strftime("%H:%M:%S", time.localtime(now)))
-                for _k, (_p, _w, _t) in enumerate(hist_imgs, 1):
-                    lines.append("附件%d = %s 在 %s 发的图（距本条约 %d 秒）"
-                                 % (_k, _w, time.strftime("%H:%M:%S", time.localtime(_t)),
-                                    max(0, int(now - _t))))
-                lines.append("先回应本条消息。只有当本条没有明确指向那张历史图，且图只是与本条话题无关的"
-                             "情绪或状态表达时，才不要在回复中谈图；否则可自然结合图来回答。"
-                             "时间间隔只作判断线索，不能单独决定是否谈图。")
-            if not lines:
-                return
-            # ⚠️ 2026-10-08（省钱要省在根上 ✓）：这一整段**每轮都在变**（定向性 + 本群最近聊天 ✗）——
-            # 以前拼进 system_prompt ✗ → 它一变，**后面的整段对话历史全部按全价重算** ✗
-            # （实测缓存命中率只有 34% ✓ 而未命中 ¥2/M vs 命中 ¥0.04/M = 差 **50 倍** ✗✗）。
-            # 改挂到 `extra_user_content_parts` ✓ —— 这是框架自带的「接在用户消息之后」的位置 ✓
-            # （框架自己的 astrbot/group_chat_context.py 就是这么用的 ✓）→ 稳定前缀不再被污染 ✓。
-            try:
-                # 用到处再导入 ✓（模块级导入在测试环境的假 astrbot 里会炸 ✗）
-                from astrbot.core.agent.message import TextPart
-                parts = getattr(request, "extra_user_content_parts", None)
-                if parts is None:
-                    parts = []
-                    request.extra_user_content_parts = parts
-                parts.append(TextPart(text=sys_tag(chr(10).join(lines))))
-            except Exception as e:
-                # 兜底：宁可费钱，不可丢上下文 ✓ —— 但要打警告 ✗（不然缓存没救回来都不知道 ✓）
-                logger.warning("[mindscape_groupctx] 挂 extra_user_content_parts 失败（缓存会吃亏），退回 system_prompt: %s", str(e)[:90])
-                request.system_prompt = ((request.system_prompt or "") + chr(10)
-                                         + sys_tag(chr(10).join(lines)))
-            if hist_imgs:
-                try:
-                    urls = getattr(request, "image_urls", None)
-                    if urls is None:
-                        urls = []
-                        request.image_urls = urls
-                    for _p, _w, _t in hist_imgs:
-                        if _p not in urls:
-                            urls.append(_p)
-                except Exception as exc:
-                    logger.warning("[mindscape_groupctx] 历史图挂载失败: %s", str(exc)[:120])
-            logger.info("[mindscape_groupctx] 注入 self=%s 群=%s 历史=%d 条 引用=%s 历史图=%d",
-                        event.get_self_id(), gid, len(recs),
-                        ("自己发的图" if (q_quoted and q_img and q_mine) else
-                         "别人的图" if (q_quoted and q_img) else "无"),
-                        len(hist_imgs))
-        except Exception as exc:
-            logger.warning("[mindscape_groupctx] 注入失败: %s", str(exc)[:120])
-
-
-class TraceMixin:
-    def setup(self, context):
-        c = cfg.section("trace")
-        self.tr_on = True if c.get("enabled") is None else bool(c.get("enabled"))
-        self.tr_warn_ms = int(c.get("warn_ms") or DEFAULT_WARN_MS)
-        self.tr_warn_chars = int(c.get("warn_chars") or DEFAULT_WARN_CHARS)
-        self.tr_pending = {}
-        logger.info(
-            "[mindscape_trace] loaded | enabled=%s | 慢于 %dms 或 system_prompt"
-            " 超过 %d 字时改成 WARNING",
-            self.tr_on, self.tr_warn_ms, self.tr_warn_chars)
-
-    def tr_label(self, event):
-        """日志里区分两个 bot 的那一列。"""
-        return "self=%s 群=%s" % (event.get_self_id(),
-                                  event.get_group_id() or "-")
-
-    def tr_remember(self, key, info):
-        self.tr_pending[key] = info
-        # 失败/中断的轮次永远等不到响应 —— 别让它把内存攒起来
-        if len(self.tr_pending) > TRACE_PENDING_MAX:
-            for k in list(self.tr_pending)[:-TRACE_PENDING_MAX // 2]:
-                self.tr_pending.pop(k, None)
-
-    @filter.on_llm_request(priority=TRACE_PRIORITY)
-    async def tr_measure_request(self, event: AstrMessageEvent,
-                                 request: ProviderRequest):
-        if not self.tr_on:
-            return
-        try:
-            hn, hc = tr_hist(request)
-            info = {
-                "t": time.time(),
-                "sys": len(request.system_prompt or ""),
-                "ctx": len(request.contexts or []),
-                "ctx_chars": tr_ctx_chars(request.contexts),
-                "hist_n": hn,
-                "hist_c": hc,
-                "tools": tr_tool_count(request),
-                "user": len(request.prompt or ""),
-            }
-            self.tr_remember(tr_key(event), info)
-            event.set_extra(TRACE_KEY, info)
-            logger.info(
-                "[mindscape_trace] 出站 %s sys=%d字 会话=%d条/%d字 上下文=%d条 工具=%d 输入=%d字"
-                " sys指纹=%s",
-                self.tr_label(event), info["sys"], info["hist_n"],
-                info["hist_c"], info["ctx"], info["tools"], info["user"],
-                tr_fp(request.system_prompt or ""))
-        except Exception as e:
-            logger.warning("[mindscape_trace] 记录请求失败: %s", str(e)[:120])
-
-    @filter.on_llm_response()
-    async def tr_measure_response(self, event: AstrMessageEvent, response):
-        if not self.tr_on:
-            return
-        try:
-            info = self.tr_pending.pop(tr_key(event), None)
-            if not isinstance(info, dict):
-                info = event.get_extra(TRACE_KEY)
-            if not isinstance(info, dict) or not info.get("t"):
-                logger.warning(
-                    "[mindscape_trace] 收到响应但没找到本轮的请求记录（出站日志可能没打）| %s",
-                    self.tr_label(event))
-                return
-            ms = int((time.time() - float(info["t"])) * 1000)
-            slow = ms >= self.tr_warn_ms
-            fat = int(info.get("sys") or 0) >= self.tr_warn_chars
-            line = ("[mindscape_trace] %s %s 耗时=%.2fs sys=%d字"
-                    " 会话=%d条/%d字 工具=%d 输入=%d字%s")
-            args = ("SLOW" if slow else ("FAT" if fat else "完成"),
-                    self.tr_label(event), ms / 1000.0,
-                    info.get("sys") or 0, info.get("hist_n") or 0,
-                    info.get("hist_c") or 0, info.get("tools") or 0,
-                    info.get("user") or 0, tr_usage(response))
-            if slow or fat:
-                logger.warning(line, *args)
-            else:
-                logger.info(line, *args)
-        except Exception as e:
-            logger.warning("[mindscape_trace] 记录耗时失败: %s", str(e)[:120])
-
-
+# ==== from plugins/MentionMixin.py ====
 class MentionMixin:
     def setup(self, context):
         self.mn_on, self.mn_targets = mn_load_config()
@@ -5195,11 +6692,12 @@ class MentionMixin:
         #   以前返回字符串 ✗ → 框架还要**再问一次模型**才知道「还想不想调工具」✗
         #   → 而那一轮要重发整段上下文、模型却只回空字（实测一天 122 次 ✗ ≈ 账单一半 ✓）。
         #   ⚠️ 必须放在**全部成功之后** ✓：失败时仍返回上面那两句话术 ✓（她才知道要补在正文里 ✓）。
+        # 2026-10-27（P3）：原来这一行下面还有一条 `return ("发好了…")` —— **不可达死代码** ✗
+        #   已删。哪天真想让她看到"发好了"，把这个 None 换掉就行 ✓
         return None
-        return ("发好了：%d 条（每条一个气泡）。这一轮要说的话就算说完了 —— "
-                "还想补就写进 lines 里，不用再另发正文。" % sent)
 
 
+# ==== from plugins/ToolscopeMixin.py ====
 class ToolscopeMixin:
     def setup(self, context):
         try:
@@ -5241,26 +6739,148 @@ class ToolscopeMixin:
                             event.get_self_id(), gone)
         except Exception as e:
             logger.warning("[mindscape_toolscope] 过滤失败: %s", str(e)[:120])
+
+
+# ==== from plugins/VoiceMixin.py ====
+class VoiceMixin:
+    def setup(self, context):
+        try:
+            self.v_cfg = vcfg()
+            # 诊断（2026-10-31）：线上出现"有配置但说缺 api_base"，先把它读的**是哪份**打出来
+            try:
+                import os as _os
+                _p = cfg.config_path()
+                _mt = time.strftime("%m-%d %H:%M", time.localtime(_os.path.getmtime(_p))) \
+                    if _os.path.exists(_p) else "不存在"
+                logger.info("[mindscape_voice] 配置来源 | path=%s | mtime=%s | api_base=%s | voice_id=%s",
+                            _p, _mt, bool(str(self.v_cfg.get("api_base") or "").strip()),
+                            bool(str(self.v_cfg.get("voice_id") or "").strip()))
+            except Exception as _e:
+                logger.warning("[mindscape_voice] 诊断失败: %s", str(_e)[:80])
+            logger.info("[mindscape_voice] loaded | enabled=%s targets=%s 只私聊=%s 上限=%s字",
+                        bool(self.v_cfg.get("enabled")),
+                        self.v_cfg.get("targets") or [],
+                        bool(self.v_cfg.get("private_only", True)),
+                        int(self.v_cfg.get("max_chars") or 120))
+        except Exception as e:
+            logger.warning("[mindscape_voice] setup 失败: %s", str(e)[:100])
+            self.v_cfg = {}
+
+    def _v_gate(self, ev, conf):
+        """能不能说语音 ⇒ (ok, 拒绝理由)。**群聊一律拒**（主人 2026-10-23：先只私聊）✓"""
+        if not conf.get("enabled"):
+            return False, "语音现在没开"
+        if ev is None:
+            return False, "拿不到会话，说不了语音"
+        try:
+            if not scope_hit(conf.get("targets"), ev.get_self_id()):
+                return False, "这个号不能说语音"
+            gid = str(ev.get_group_id() or "")
+            if conf.get("private_only", True) and gid:
+                return False, "只在私聊能说语音，群里用文字"
+            # ⚠️ 群白名单（显式 ✓ 空表**不等于**全开）：只在这些群才允许说语音
+            gl = [str(x) for x in (conf.get("groups") or []) if str(x).strip()]
+            if gid and gl and gid not in gl:
+                return False, "这个群不开语音，用文字"
+        except Exception:
+            return False, "判断不了当前会话"
+        return True, ""
+
+    @llm_tool(name="say_voice")
+    async def say_voice(self, *args, **kwargs):
+        """用**语音**把这句话说出来（纯语音，不带文字）。
+
+        什么时候用：你想用**声音**说的时刻 —— 撒娇、逗人、笑出声、突然正经地关心他、
+        压低声音说重话，或者对方明确让你说句话 / 发条语音。
+
+        什么时候**不要**用：纯信息、解释、长句、要点多的内容（那些用文字别人才看得清）；
+        也别连着用 —— 偶尔来一下才有意思。
+
+        Args:
+            text(string): 要念出来的那句话。只写你要说出口的话，不要写括号里的动作或心理描写。
+        """
+        text = str(kwargs.get("text") or "").strip()
+        ev = None
+        for a in args:
+            if hasattr(a, "get_self_id"):
+                ev = a
+                break
+        conf = getattr(self, "v_cfg", None) or {}
+        ok, why = self._v_gate(ev, conf)
+        if not ok:
+            return why + " —— 用文字说吧"
+        if not text:
+            return "要念的话是空的 —— 把想说的话写进 text"
+        max_chars = int(conf.get("max_chars") or 120)
+        if len(text) > max_chars:
+            return "这句 %d 字，超过 %d 就念不动了 —— 用文字说，或者缩短了再说" % (len(text), max_chars)
+        try:
+            loop = asyncio.get_event_loop()
+            path = await loop.run_in_executor(None, vc_synth, conf, text)
+        except Exception as e:
+            logger.warning("[mindscape_voice] 合成异常: %s", str(e)[:120])
+            path = None
+        if not path:
+            return "语音没合成出来 —— 还是用文字说吧"
+        # ⚠️ 2026-10-23 主人要求：正文**不发群里**，但**日志里必须看得到** ⇒ 否则不可观测 ✗
+        #    2026-10-25 改：**不截断**（原来 text[:80] ⇒ 超 80 字的语音在日志里只剩半句 ✗，
+        #    补档时 46 条里有 11 条因此是残句 ✓）；上限由 max_chars 管（默认 120）✓
+        logger.info("[mindscape_voice] 语音已发出 | %d 字 → %s | 正文: %s",
+                    len(text), os.path.basename(path), text)
+        # ⚠️ 2026-10-25 主人定：语音也要进发言档案 —— 否则 recall 取不回她"说过"的话 ✗
+        va_archive_voice(ev, text)
+        try:
+            r = MessageEventResult()
+            r.chain = [Record(file=path)]
+            return r
+        except Exception as e:
+            logger.warning("[mindscape_voice] 构造结果失败: %s", str(e)[:120])
+            return "发语音失败 —— 还是用文字说吧"
+
+
+# ==== from plugins/BubbleMixin.py ====
+class BubbleMixin:
+    """启动时把「冒泡提示词」同步成 config 里那一份（幂等）。"""
+
+    def setup(self, context):
+        c = bb_conf()
+        self.bb_on = c.get("enabled") is not False
+        logger.info("[mindscape_bubble] loaded | enabled=%s | targets=%d 个",
+                    self.bb_on, len(c.get("targets") or []))
+
+    @filter.on_astrbot_loaded()
+    async def bb_sync_on_load(self, *args, **kwargs):
+        try:
+            c = bb_conf()
+            if c.get("enabled") is False:
+                logger.info("[mindscape_bubble] 已在配置里关掉，跳过同步")
+                return
+            seen, changed = bb_sync()
+            logger.info("[mindscape_bubble] 冒泡提示词同步：扫到 %d 个任务，改了 %d 个", seen, changed)
+        except Exception as e:
+            logger.warning("[mindscape_bubble] 同步异常: %s", str(e)[:120])
 # ==================================================================
 # 插件入口：把所有 Mixin 的钩子收进同一个类
 # ==================================================================
-class MindscapePlugin(BlockMixin, GuardMixin, MemoryMixin, PrivacyMixin, StickersMixin, StickerUseMixin, FormatMixin, RescueMixin, SilenceMixin, VisionMixin, GroupctxMixin, TraceMixin, MentionMixin, ToolscopeMixin, star.Star):
+class MindscapePlugin(GroupctxMixin, BlockMixin, GuardMixin, SilenceMixin, VisionMixin, MemoryMixin, PrivacyMixin, StickersMixin, StickerUseMixin, FormatMixin, TraceMixin, RescueMixin, MentionMixin, ToolscopeMixin, VoiceMixin, BubbleMixin, star.Star):
     def __init__(self, context):
         self.context = context
         self.name = "mindscape"
         self.author = "bot-mindscape"
+        GroupctxMixin.setup(self, context)
         BlockMixin.setup(self, context)
         GuardMixin.setup(self, context)
+        SilenceMixin.setup(self, context)
+        VisionMixin.setup(self, context)
         MemoryMixin.setup(self, context)
         PrivacyMixin.setup(self, context)
         StickersMixin.setup(self, context)
         StickerUseMixin.setup(self, context)
         FormatMixin.setup(self, context)
-        RescueMixin.setup(self, context)
-        SilenceMixin.setup(self, context)
-        VisionMixin.setup(self, context)
-        GroupctxMixin.setup(self, context)
         TraceMixin.setup(self, context)
+        RescueMixin.setup(self, context)
         MentionMixin.setup(self, context)
         ToolscopeMixin.setup(self, context)
-        logger.info("[mindscape] 插件已加载（14 个模块）")
+        VoiceMixin.setup(self, context)
+        BubbleMixin.setup(self, context)
+        logger.info("[mindscape] 插件已加载（16 个模块）")
