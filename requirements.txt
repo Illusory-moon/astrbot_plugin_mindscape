@@ -1,4 +1,8 @@
 # 插件运行依赖（AstrBot 通常已自带）
+#
+# ⚠️ 装到【跑 AstrBot 的那个解释器 / 容器】里 —— 宿主机装它看不到 ✗
+#    容器：docker exec -it <容器名> pip install PyYAML httpx pillow
+# 自检：主仓库的 python scripts/check_deps.py 会打出解释器路径与缺失项 ✓
 PyYAML>=6.0        # 配置读写
 httpx>=0.24        # 视觉判定 / 选图请求（表情包层）
 Pillow>=9.0        # 大图和动图预览
