@@ -6,6 +6,25 @@
 
 <img src="assets/demo-2-memory.png" width="600" alt="三天前的事它还记着">
 
+## 先说三件事（能省你半小时）
+
+1. 🧭 **它有自己的一套管理台，不用碰 AstrBot 的网页界面** ✗
+   配置、图库、记忆都在**本项目自己的界面**里看和改：
+   - 桌面版：`python scripts/config_gui.py`
+   - 网页版：`python scripts/web_ui.py`（或 Windows 双击 `open_dashboard.bat`；只监听本机，端口 8777–8787 自动挑）
+
+   AstrBot 的 web UI 只需要**装插件、绑人格** —— 别在那里翻本项目的配置 ✓
+2. 📖 **第一次装？先看主仓库的 [QUICKSTART](https://github.com/Illusory-moon/bot-mindscape/blob/main/QUICKSTART.md)**
+   （三条路径任选 + 三步验收，5 分钟）；**想让它自己装**就把
+   [DEPLOY-WITH-AI](https://github.com/Illusory-moon/bot-mindscape/blob/main/DEPLOY-WITH-AI.md) 整段粘给 AI ✓
+3. 🧩 本仓库里的 `main.py` 是**构建产物**（由主仓库 `scripts/build_plugin.py --market` 生成）——
+   要改逻辑请去 [主仓库](https://github.com/Illusory-moon/bot-mindscape)，别手改这里 ✓
+
+> 卡住了 → [常见问题对照表](https://github.com/Illusory-moon/bot-mindscape/blob/main/docs/troubleshooting.md)
+> （模块不加载 / 不回复 / 配置读不到 / 报错漏进群 / 管理台 / 依赖）
+
+---
+
 ## 它做什么
 
 ### 一、认知层 —— 长期记忆
@@ -73,7 +92,14 @@ git clone https://github.com/Illusory-moon/astrbot_plugin_mindscape.git
 
 ```
 [mindscape] 插件已加载（16 个模块）
+[mindscape_memory] loaded | 1 bot(s) 配置了记忆
 ```
+
+**三步验收**：① 日志有上面的 `loaded` 行 ② 私聊它一句会回 ③ 群里 @ 它会回 ✓
+
+> **第一次配**：可以先只填 `memory:` 一段（最小可用见主仓库
+> [`config/config.minimal.yaml`](https://github.com/Illusory-moon/bot-mindscape/blob/main/config/config.minimal.yaml)），
+> 其余段不写就不生效 —— 不用一次配全 ✓
 
 ## 配置
 
@@ -104,6 +130,14 @@ memory:
 ```
 
 > 配置里写的 `./data/xxx.md` 都相对**配置文件所在目录**解析 —— 数据跟着配置走，整体搬迁不会断。
+
+**怎么改配置**（选一个，别用 AstrBot 的网页界面）✗
+
+| 方式 | 怎么用 |
+|---|---|
+| 我们自己的管理台（推荐）| 桌面 `python scripts/config_gui.py` / 网页 `python scripts/web_ui.py`；改的是**本机副本**，点「同步服务器」推过去 |
+| 直接编辑文件 | 打开上面那个 `config.yaml` 改，保存后重启 AstrBot |
+| 让 AI 代劳 | 把 [DEPLOY-WITH-AI](https://github.com/Illusory-moon/bot-mindscape/blob/main/DEPLOY-WITH-AI.md) 粘给它 |
 
 ## 哪些功能需要额外打补丁
 
